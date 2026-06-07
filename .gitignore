@@ -32,3 +32,6 @@ env/
 .idea/
 *.swp
 .DS_Store
+
+# Personal notes (not tracked)
+explain.md
