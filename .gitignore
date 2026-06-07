@@ -1,0 +1,34 @@
+# Compiled C / CUDA artifacts
+*.o
+*.obj
+*.out
+*.exe
+*.so
+*.a
+a.out
+
+# CUDA / build outputs
+*.ptx
+*.cubin
+*.fatbin
+build/
+bin/
+
+# Python (agent tooling)
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+*.egg-info/
+.ipynb_checkpoints/
+
+# Environment / secrets
+.env
+.env.local
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
