@@ -4,6 +4,9 @@ Turn the C reference programs in `benchmark/` into CUDA programs in `cuda/`, the
 verify each one against its CPU baseline on this laptop's GPU — driven by
 [opencode](https://opencode.ai) as the conversion agent.
 
+> Want to know *how the agent works inside* (prompt layers + the agent loop)?
+> See [`AGENT_WORKFLOW.md`](AGENT_WORKFLOW.md). This file is the *usage* guide.
+
 ```
 benchmark/<tier>/<field>/<name>.c   ──/cudaify──►   cuda/<tier>/<field>/<name>.cu
         (CPU baseline, read-only)      (opencode)         (GPU conversion)
