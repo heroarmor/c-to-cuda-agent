@@ -199,6 +199,17 @@ __global__ void pathtrace_kernel(V *img, int w, int h, int spp,
     img[idx] = r;
 }
 
+/* second kernel kind: tonemap/post-process the linear radiance -> 8-bit RGB
+ * (gamma 2.2), the standard render-then-tonemap pipeline stage. */
+__device__ static double d_clampd(double x) { return x < 0 ? 0 : (x > 1 ? 1 : x); }
+__global__ void tonemap_kernel(const V *img, unsigned char *bytes, int npix) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= npix) return;
+    bytes[3 * i + 0] = (unsigned char)(int)(pow(d_clampd(img[i].x), 1 / 2.2) * 255 + .5);
+    bytes[3 * i + 1] = (unsigned char)(int)(pow(d_clampd(img[i].y), 1 / 2.2) * 255 + .5);
+    bytes[3 * i + 2] = (unsigned char)(int)(pow(d_clampd(img[i].z), 1 / 2.2) * 255 + .5);
+}
+
 static inline double clampd(double x) { return x < 0 ? 0 : (x > 1 ? 1 : x); }
 static inline int toInt(double x) { return (int)(pow(clampd(x), 1 / 2.2) * 255 + .5); }
 
@@ -233,27 +244,32 @@ int main(int argc, char **argv) {
     int threads = 256;
     int blocks = (int)((npix + threads - 1) / threads);
 
+    unsigned char *d_bytes;
+    CUDA_CHECK(cudaMalloc(&d_bytes, npix * 3));
+
     clock_t t0 = clock();
     pathtrace_kernel<<<blocks, threads>>>(d_img, w, h, spp,
                                            cam_o.x, cam_o.y, cam_o.z,
                                            cx.x, cx.y, cx.z,
                                            cy.x, cy.y, cy.z,
                                            cam_d.x, cam_d.y, cam_d.z);
+    CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
     clock_t t1 = clock();
 
-    V *img = (V *)malloc(img_bytes);
-    CUDA_CHECK(cudaMemcpy(img, d_img, img_bytes, cudaMemcpyDeviceToHost));
+    /* second kernel kind: tonemap the radiance buffer to 8-bit RGB on the GPU */
+    tonemap_kernel<<<blocks, threads>>>(d_img, d_bytes, (int)npix);
+    CUDA_CHECK(cudaGetLastError());
 
+    V *img = (V *)malloc(img_bytes);
     unsigned char *bytes = (unsigned char *)malloc(npix * 3);
+    CUDA_CHECK(cudaMemcpy(img, d_img, img_bytes, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(bytes, d_bytes, npix * 3, cudaMemcpyDeviceToHost));
+
     long long sum = 0;
     double lum = 0.0;
     for (size_t i = 0; i < npix; ++i) {
-        int R = toInt(img[i].x), G = toInt(img[i].y), B = toInt(img[i].z);
-        bytes[3 * i] = (unsigned char)R;
-        bytes[3 * i + 1] = (unsigned char)G;
-        bytes[3 * i + 2] = (unsigned char)B;
-        sum += R + G + B;
+        sum += bytes[3 * i] + bytes[3 * i + 1] + bytes[3 * i + 2];
         lum += 0.2126 * img[i].x + 0.7152 * img[i].y + 0.0722 * img[i].z;
     }
 
@@ -268,6 +284,7 @@ int main(int argc, char **argv) {
            w, h, spp, sum, lum / (double)npix, (double)(t1 - t0) / CLOCKS_PER_SEC);
 
     CUDA_CHECK(cudaFree(d_img));
+    CUDA_CHECK(cudaFree(d_bytes));
     free(img); free(bytes);
     return 0;
 }

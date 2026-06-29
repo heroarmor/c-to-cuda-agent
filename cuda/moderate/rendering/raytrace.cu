@@ -1,4 +1,11 @@
 /* raytrace.cu -- CUDA conversion of benchmark/moderate/rendering/raytrace.c
+ *
+ * Two-pass (deferred) ray tracer: two distinct kernels collaborate via a
+ * per-pixel G-buffer.
+ *   1) primary_kernel -- cast the primary ray, find nearest sphere -> (id, t),
+ *                        count hits
+ *   2) shade_kernel   -- consume the G-buffer: shadow test + shading -> RGB,
+ *                        count shadows
  * One thread per pixel; scene in constant memory.
  */
 #include <stdio.h>
@@ -39,40 +46,61 @@ __device__ static double hit(V o, V d, Sphere s) {
     return (t > 1e-4) ? t : -1.0;
 }
 
-__global__ void raytrace_kernel(int w, int h, V light,
-                                 unsigned char *img,
-                                 unsigned long long *hits, unsigned long long *shadows) {
+/* per-pixel primary ray direction (identical formula in both passes) */
+__device__ static V ray_dir(int px, int py, int w, int h) {
+    double u = (2.0 * (px + 0.5) / w - 1.0) * ((double)w / h);
+    double v = (1.0 - 2.0 * (py + 0.5) / h);
+    return vnorm((V){ u, v, -1.0 });
+}
+
+/* pass 1: nearest-hit G-buffer */
+__global__ void primary_kernel(int w, int h, int *gid, double *gt,
+                               unsigned long long *hits) {
     int px = blockIdx.x * blockDim.x + threadIdx.x;
     int py = blockIdx.y * blockDim.y + threadIdx.y;
     if (px >= w || py >= h) return;
 
     V eye = { 0.0, 0.0, 0.0 };
-    double u = (2.0 * (px + 0.5) / w - 1.0) * ((double)w / h);
-    double v = (1.0 - 2.0 * (py + 0.5) / h);
-    V dir = vnorm((V){ u, v, -1.0 });
-
+    V dir = ray_dir(px, py, w, h);
     double tbest = 1e30;
     int id = -1;
     for (int i = 0; i < NS; ++i) {
         double t = hit(eye, dir, d_scene[i]);
         if (t > 0.0 && t < tbest) { tbest = t; id = i; }
     }
+    size_t idx = (size_t)py * w + px;
+    gid[idx] = id;
+    gt[idx]  = tbest;
+    if (id >= 0) atomicAdd(hits, 1ULL);
+}
+
+/* pass 2: shading + shadow test from the G-buffer */
+__global__ void shade_kernel(int w, int h, V light, const int *gid, const double *gt,
+                             unsigned char *img, unsigned long long *shadows) {
+    int px = blockIdx.x * blockDim.x + threadIdx.x;
+    int py = blockIdx.y * blockDim.y + threadIdx.y;
+    if (px >= w || py >= h) return;
+
+    size_t idx = (size_t)py * w + px;
+    int id = gid[idx];
+    V eye = { 0.0, 0.0, 0.0 };
+    V dir = ray_dir(px, py, w, h);
 
     V col = { 0.1, 0.1, 0.15 };
     if (id >= 0) {
-        atomicAdd(hits, 1LL);
+        double tbest = gt[idx];
         V p = vadd(eye, vscl(dir, tbest));
         V nrm = vnorm(vsub(p, d_scene[id].c));
         int shadow = 0;
         V po = vadd(p, vscl(nrm, 1e-3));
         for (int i = 0; i < NS; ++i)
             if (hit(po, light, d_scene[i]) > 0.0) { shadow = 1; break; }
-        if (shadow) atomicAdd(shadows, 1LL);
+        if (shadow) atomicAdd(shadows, 1ULL);
         double diff = shadow ? 0.0 : fmax(0.0, vdot(nrm, light));
         col = vscl(d_scene[id].color, 0.15 + 0.85 * diff);
     }
 
-    size_t o = ((size_t)py * w + px) * 3;
+    size_t o = idx * 3;
     img[o + 0] = (unsigned char)(255.0 * fmin(1.0, col.x));
     img[o + 1] = (unsigned char)(255.0 * fmin(1.0, col.y));
     img[o + 2] = (unsigned char)(255.0 * fmin(1.0, col.z));
@@ -86,10 +114,14 @@ int main(int argc, char **argv) {
     if (!h_img) { fprintf(stderr, "alloc failed\n"); return 1; }
 
     unsigned char *d_img;
+    int *d_gid;
+    double *d_gt;
     unsigned long long *d_hits, *d_shadows;
     unsigned long long h_hits = 0, h_shadows = 0;
 
     CUDA_CHECK(cudaMalloc(&d_img, (size_t)w * h * 3));
+    CUDA_CHECK(cudaMalloc(&d_gid, (size_t)w * h * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_gt,  (size_t)w * h * sizeof(double)));
     CUDA_CHECK(cudaMalloc(&d_hits, sizeof(unsigned long long)));
     CUDA_CHECK(cudaMalloc(&d_shadows, sizeof(unsigned long long)));
 
@@ -114,7 +146,9 @@ int main(int argc, char **argv) {
     dim3 grid((w + block.x - 1) / block.x, (h + block.y - 1) / block.y);
 
     clock_t t0 = clock();
-    raytrace_kernel<<<grid, block>>>(w, h, light, d_img, d_hits, d_shadows);
+    primary_kernel<<<grid, block>>>(w, h, d_gid, d_gt, d_hits);
+    shade_kernel<<<grid, block>>>(w, h, light, d_gid, d_gt, d_img, d_shadows);
+    CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
     clock_t t1 = clock();
 
@@ -136,6 +170,8 @@ int main(int argc, char **argv) {
            w, h, sum, (long long)h_hits, (long long)h_shadows, (double)(t1 - t0) / CLOCKS_PER_SEC);
 
     CUDA_CHECK(cudaFree(d_img));
+    CUDA_CHECK(cudaFree(d_gid));
+    CUDA_CHECK(cudaFree(d_gt));
     CUDA_CHECK(cudaFree(d_hits));
     CUDA_CHECK(cudaFree(d_shadows));
     free(h_img);

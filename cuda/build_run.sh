@@ -53,9 +53,10 @@ OUT_C="$("$BIN_C" "${ARGS[@]}")";  echo "    $OUT_C"
 echo "==> running GPU conversion"
 OUT_CU="$("$BIN_CU" "${ARGS[@]}")"; echo "    $OUT_CU"
 
-# Drop the time field and any (parenthetical) perf-rate / annotation, then pull
-# out every numeric token that remains.
-strip_perf() { sed -E 's/time=[^[:space:]]*[[:space:]]*s?//g; s/\([^)]*\)//g' <<<"$1"; }
+# Drop timing fields and any (parenthetical) perf-rate / annotation, then pull
+# out every numeric token that remains.  Timing fields are any "<label>=<num> s"
+# duration token (time=, D-apply=, ...) -- they legitimately differ CPU vs GPU.
+strip_perf() { sed -E 's/[A-Za-z][A-Za-z0-9_.-]*=[-+]?[0-9.]+([eE][-+]?[0-9]+)?[[:space:]]+s\b//g; s/time=[^[:space:]]*[[:space:]]*s?//g; s/\([^)]*\)//g' <<<"$1"; }
 nums() { grep -oE '[-+]?[0-9]+\.?[0-9]*([eE][-+]?[0-9]+)?' <<<"$1" || true; }
 
 mapfile -t A < <(nums "$(strip_perf "$OUT_C")")

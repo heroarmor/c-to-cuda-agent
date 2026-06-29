@@ -30,16 +30,15 @@ __constant__ int    d_ex[9];
 __constant__ int    d_ey[9];
 __constant__ double d_wt[9];
 
-__global__ void collide_stream(int nx, int ny, double tau,
-                               const double *f, double *ft) {
+/* kernel 1: BGK collision in place (compute moments -> relax toward equilibrium) */
+__global__ void collide_kernel(int nx, int ny, double tau, double *f) {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= nx || y >= ny) return;
 
     size_t cell = (size_t)y * nx + x;
-    const double *fc = &f[cell * 9];
+    double *fc = &f[cell * 9];
 
-    /* macroscopic moments */
     double rho = 0, ux = 0, uy = 0;
 #pragma unroll
     for (int i = 0; i < 9; ++i) {
@@ -51,15 +50,26 @@ __global__ void collide_stream(int nx, int ny, double tau,
     uy /= rho;
     double u2 = ux * ux + uy * uy;
 
-    /* BGK collision + periodic streaming */
 #pragma unroll
     for (int i = 0; i < 9; ++i) {
         double eu  = d_ex[i] * ux + d_ey[i] * uy;
         double feq = d_wt[i] * rho * (1.0 + 3.0 * eu + 4.5 * eu * eu - 1.5 * u2);
-        double post = fc[i] - (fc[i] - feq) / tau;
+        fc[i] = fc[i] - (fc[i] - feq) / tau;       /* post-collision, in place */
+    }
+}
+
+/* kernel 2: periodic streaming -- push post-collision populations to neighbours */
+__global__ void stream_kernel(int nx, int ny, const double *fpost, double *ft) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= nx || y >= ny) return;
+
+    const double *fc = &fpost[((size_t)y * nx + x) * 9];
+#pragma unroll
+    for (int i = 0; i < 9; ++i) {
         int xn = (x + d_ex[i] + nx) % nx;
         int yn = (y + d_ey[i] + ny) % ny;
-        ft[((size_t)yn * nx + xn) * 9 + i] = post;
+        ft[((size_t)yn * nx + xn) * 9 + i] = fc[i];
     }
 }
 
@@ -122,7 +132,9 @@ int main(int argc, char **argv) {
 
     clock_t t0 = clock();
     for (int s = 0; s < steps; ++s) {
-        collide_stream<<<blocks, threads>>>(nx, ny, tau, d_f, d_ft);
+        collide_kernel<<<blocks, threads>>>(nx, ny, tau, d_f);
+        stream_kernel<<<blocks, threads>>>(nx, ny, d_f, d_ft);
+        CUDA_CHECK(cudaGetLastError());
         double *tmp = d_f; d_f = d_ft; d_ft = tmp;
     }
     CUDA_CHECK(cudaDeviceSynchronize());

@@ -1,8 +1,11 @@
 /* wave2d.cu -- CUDA conversion of benchmark/moderate/pde/wave2d.c
- * 2D wave equation via explicit finite differences.
- * Three device buffers (prev/cur/next) are rotated by pointer swap on the
- * host; the time-stepping loop stays on the host.  A 2-D thread grid covers
- * the interior points.
+ *
+ * 2D wave equation via explicit finite differences, in operator-split form so
+ * each time step runs two distinct kernels that collaborate:
+ *   1) laplacian_kernel  -- materialise the discrete Laplacian field of cur
+ *   2) integrate_kernel  -- leapfrog update  next = 2*cur - prev + C2*lap
+ * Three device buffers (prev/cur/next) rotate by host pointer swap; the time
+ * loop stays on the host (frequent, e2e kernel invocation).
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -20,17 +23,24 @@
         }                                                                     \
     } while (0)
 
-/* One thread per interior cell (1 <= x,y < m-1) */
-__global__ void wave_step_kernel(int m, double C2,
-                                  const double *prev,
-                                  const double *cur,
-                                  double *next) {
+/* kernel 1: discrete Laplacian of the interior (1 <= x,y < m-1) */
+__global__ void laplacian_kernel(int m, const double *cur, double *lap) {
     int x = blockIdx.x * blockDim.x + threadIdx.x + 1;
     int y = blockIdx.y * blockDim.y + threadIdx.y + 1;
     if (x < m - 1 && y < m - 1) {
         int i = y * m + x;
-        double lap = cur[i - 1] + cur[i + 1] + cur[i - m] + cur[i + m] - 4.0 * cur[i];
-        next[i] = 2.0 * cur[i] - prev[i] + C2 * lap;
+        lap[i] = cur[i - 1] + cur[i + 1] + cur[i - m] + cur[i + m] - 4.0 * cur[i];
+    }
+}
+
+/* kernel 2: leapfrog time integration consuming the Laplacian field */
+__global__ void integrate_kernel(int m, double C2, const double *prev,
+                                  const double *cur, const double *lap, double *next) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x + 1;
+    int y = blockIdx.y * blockDim.y + threadIdx.y + 1;
+    if (x < m - 1 && y < m - 1) {
+        int i = y * m + x;
+        next[i] = 2.0 * cur[i] - prev[i] + C2 * lap[i];
     }
 }
 
@@ -54,7 +64,6 @@ int main(int argc, char **argv) {
     size_t N = (size_t)m * m;
     size_t bytes = N * sizeof(double);
 
-    /* host arrays (for init + final verification) */
     double *h_cur = (double *)malloc(bytes);
     double *h_prev = (double *)malloc(bytes);
     if (!h_cur || !h_prev) { fprintf(stderr, "host alloc failed\n"); return 1; }
@@ -69,32 +78,30 @@ int main(int argc, char **argv) {
             h_prev[(size_t)y * m + x] = val;
         }
 
-    /* device arrays */
-    double *d_prev, *d_cur, *d_next;
+    double *d_prev, *d_cur, *d_next, *d_lap;
     CUDA_CHECK(cudaMalloc(&d_prev, bytes));
     CUDA_CHECK(cudaMalloc(&d_cur,  bytes));
     CUDA_CHECK(cudaMalloc(&d_next, bytes));
+    CUDA_CHECK(cudaMalloc(&d_lap,  bytes));
 
     CUDA_CHECK(cudaMemcpy(d_cur,  h_cur,  bytes, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_prev, h_prev, bytes, cudaMemcpyHostToDevice));
-    /* next will be overwritten; no need to initialise */
 
-    /* initial discrete energy (host-side, h_prev == h_cur still) */
     double E0 = wave_energy(m, C2, h_cur, h_prev);
 
-    /* 2-D block/grid covering the interior (1 .. m-2) */
     dim3 block(16, 16);
     dim3 grid((m + block.x - 2) / block.x, (m + block.y - 2) / block.y);
 
     clock_t t0 = clock();
     for (int s = 0; s < steps; ++s) {
-        wave_step_kernel<<<grid, block>>>(m, C2, d_prev, d_cur, d_next);
-        CUDA_CHECK(cudaDeviceSynchronize());
+        laplacian_kernel<<<grid, block>>>(m, d_cur, d_lap);
+        integrate_kernel<<<grid, block>>>(m, C2, d_prev, d_cur, d_lap, d_next);
+        CUDA_CHECK(cudaGetLastError());
         double *t = d_prev; d_prev = d_cur; d_cur = d_next; d_next = t;
     }
+    CUDA_CHECK(cudaDeviceSynchronize());
     clock_t t1 = clock();
 
-    /* copy final cur and prev back for host-side verification */
     CUDA_CHECK(cudaMemcpy(h_cur,  d_cur,  bytes, cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(h_prev, d_prev, bytes, cudaMemcpyDeviceToHost));
 
@@ -110,6 +117,7 @@ int main(int argc, char **argv) {
     CUDA_CHECK(cudaFree(d_prev));
     CUDA_CHECK(cudaFree(d_cur));
     CUDA_CHECK(cudaFree(d_next));
+    CUDA_CHECK(cudaFree(d_lap));
     free(h_cur); free(h_prev);
     return 0;
 }

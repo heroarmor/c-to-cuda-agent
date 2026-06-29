@@ -1,8 +1,14 @@
 /* jacobi_eigen.cu -- CUDA conversion of benchmark/complex/eigen/jacobi_eigen.c
  *
- * Cyclic Jacobi eigenvalue solver for a dense symmetric matrix.  The sweep
- * and pair iteration run sequentially on one thread-block; each rotation's
- * row/column update is parallelised across threads via grid-stride loops.
+ * Cyclic Jacobi eigenvalue solver. Two kernel kinds collaborate per sweep:
+ *   1) jacobi_sweep_kernel -- one block runs the (intrinsically sequential)
+ *      pair loop; threads parallelise each rotation's length-n row/col update.
+ *   2) offnorm_kernel       -- multi-block reduction of the off-diagonal norm
+ *      used for the convergence test (replaces a per-sweep full-matrix copy).
+ *
+ * The cyclic ordering is sequential, so `sweeps` (a reported field) depends on
+ * exact arithmetic; rotations use round-to-nearest, no-FMA intrinsics so the
+ * GPU matrix stays bit-identical to the CPU baseline and the sweep count matches.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -20,19 +26,22 @@
         }                                                                     \
     } while (0)
 
-/* One block performs one cyclic Jacobi sweep on the GPU.
- * Shared memory layout:
- *   [0]                 rotation cosine  (c)
- *   [1]                 rotation sine    (s)
- */
+/* round-to-nearest, no-contraction rotate of a pair (prevents FMA divergence) */
+__device__ static inline double rot_a(double c, double s, double a, double b) {
+    return __dsub_rn(__dmul_rn(c, a), __dmul_rn(s, b));   /* c*a - s*b */
+}
+__device__ static inline double rot_b(double c, double s, double a, double b) {
+    return __dadd_rn(__dmul_rn(s, a), __dmul_rn(c, b));   /* s*a + c*b */
+}
+
+/* one cyclic Jacobi sweep on a single block */
 __global__ void jacobi_sweep_kernel(int n, double *A) {
-    extern __shared__ double shared[];
+    __shared__ double cs[2];
     int tid = threadIdx.x;
     int nt  = blockDim.x;
 
     for (int p = 0; p < n; ++p) {
         for (int q = p + 1; q < n; ++q) {
-            /* Thread 0 computes the Jacobi rotation (c,s). */
             if (tid == 0) {
                 double apq = A[p * n + q];
                 if (fabs(apq) > 1e-300) {
@@ -41,37 +50,52 @@ __global__ void jacobi_sweep_kernel(int n, double *A) {
                     double theta = (aqq - app) / (2.0 * apq);
                     double t = (theta >= 0.0 ? 1.0 : -1.0)
                                / (fabs(theta) + sqrt(theta * theta + 1.0));
-                    shared[0] = 1.0 / sqrt(t * t + 1.0);
-                    shared[1] = t * shared[0];
+                    cs[0] = 1.0 / sqrt(t * t + 1.0);
+                    cs[1] = t * cs[0];
                 } else {
-                    shared[0] = 1.0;
-                    shared[1] = 0.0;
+                    cs[0] = 1.0;
+                    cs[1] = 0.0;
                 }
             }
             __syncthreads();
+            double c = cs[0], s = cs[1];
 
-            double c = shared[0];
-            double s = shared[1];
-
-            /* rotate columns p,q */
-            for (int i = tid; i < n; i += nt) {
+            for (int i = tid; i < n; i += nt) {            /* rotate columns p,q */
                 double aip = A[i * n + p];
                 double aiq = A[i * n + q];
-                A[i * n + p] = c * aip - s * aiq;
-                A[i * n + q] = s * aip + c * aiq;
+                A[i * n + p] = rot_a(c, s, aip, aiq);
+                A[i * n + q] = rot_b(c, s, aip, aiq);
             }
             __syncthreads();
-
-            /* rotate rows p,q */
-            for (int i = tid; i < n; i += nt) {
+            for (int i = tid; i < n; i += nt) {            /* rotate rows p,q */
                 double api = A[p * n + i];
                 double aqi = A[q * n + i];
-                A[p * n + i] = c * api - s * aqi;
-                A[q * n + i] = s * api + c * aqi;
+                A[p * n + i] = rot_a(c, s, api, aqi);
+                A[q * n + i] = rot_b(c, s, api, aqi);
             }
             __syncthreads();
         }
     }
+}
+
+/* second kernel kind: sum of squares of the strict upper triangle (off-norm^2) */
+__global__ void offnorm_kernel(int n, const double *A, double *partial) {
+    extern __shared__ double sh[];
+    int tid = threadIdx.x;
+    long total = (long)n * n;
+    double s = 0.0;
+    for (long idx = (long)blockIdx.x * blockDim.x + tid; idx < total;
+         idx += (long)blockDim.x * gridDim.x) {
+        int p = (int)(idx / n), q = (int)(idx % n);
+        if (q > p) { double a = A[idx]; s += a * a; }
+    }
+    sh[tid] = s;
+    __syncthreads();
+    for (int k = blockDim.x / 2; k > 0; k >>= 1) {
+        if (tid < k) sh[tid] += sh[tid + k];
+        __syncthreads();
+    }
+    if (tid == 0) partial[blockIdx.x] = sh[0];
 }
 
 int main(int argc, char **argv) {
@@ -94,25 +118,27 @@ int main(int argc, char **argv) {
     CUDA_CHECK(cudaMemcpy(d_A, h_A, bytes, cudaMemcpyHostToDevice));
 
     int threads = 256;
-    size_t shmem = 2 * sizeof(double);
+    int rblocks = 256;
+    double *d_partial, *h_partial = (double *)malloc(rblocks * sizeof(double));
+    CUDA_CHECK(cudaMalloc(&d_partial, rblocks * sizeof(double)));
 
     int sweeps = 0;
     clock_t t0 = clock();
     for (int sweep = 0; sweep < max_sweeps; ++sweep) {
-        jacobi_sweep_kernel<<<1, threads, shmem>>>(n, d_A);
-        CUDA_CHECK(cudaDeviceSynchronize());
+        jacobi_sweep_kernel<<<1, threads>>>(n, d_A);
+        CUDA_CHECK(cudaGetLastError());
 
-        CUDA_CHECK(cudaMemcpy(h_A, d_A, bytes, cudaMemcpyDeviceToHost));
-
+        offnorm_kernel<<<rblocks, threads, threads * sizeof(double)>>>(n, d_A, d_partial);
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaMemcpy(h_partial, d_partial, rblocks * sizeof(double), cudaMemcpyDeviceToHost));
         double off = 0.0;
-        for (int p = 0; p < n; ++p)
-            for (int q = p + 1; q < n; ++q)
-                off += h_A[p * n + q] * h_A[p * n + q];
+        for (int i = 0; i < rblocks; ++i) off += h_partial[i];
         if (sqrt(off) < tol) { sweeps = sweep + 1; break; }
     }
     clock_t t1 = clock();
     if (sweeps == 0) sweeps = max_sweeps;
 
+    CUDA_CHECK(cudaMemcpy(h_A, d_A, bytes, cudaMemcpyDeviceToHost));
     double tr = 0.0, emin = h_A[0], emax = h_A[0];
     for (int i = 0; i < n; ++i) {
         double e = h_A[i * n + i];
@@ -130,6 +156,8 @@ int main(int argc, char **argv) {
            emin, emin_exact, emax, emax_exact, (double)(t1 - t0) / CLOCKS_PER_SEC);
 
     CUDA_CHECK(cudaFree(d_A));
+    CUDA_CHECK(cudaFree(d_partial));
+    free(h_partial);
     free(h_A);
     return 0;
 }
