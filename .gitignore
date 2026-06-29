@@ -47,3 +47,7 @@ explain.md
 # (the reference images under benchmark/ stay tracked)
 /*.pgm
 /*.ppm
+
+# generated evaluation reports / raw TSVs (framework + .gitkeep stay tracked)
+evaluation/results/*
+!evaluation/results/.gitkeep
