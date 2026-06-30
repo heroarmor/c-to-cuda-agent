@@ -35,3 +35,12 @@ env/
 
 # Personal notes (not tracked)
 explain.md
+
+AGENTS.md
+progress/
+cuda/
+
+.opencode/node_modules/
+.opencode/package.json
+.opencode/package-lock.json
+.opencode/bun.lock
