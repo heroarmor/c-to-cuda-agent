@@ -1,7 +1,0 @@
--std=c11
--Wall
--Wextra
--I.
--Imulti_kernels
--Isingle_kernel
--Itools

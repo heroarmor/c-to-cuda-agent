@@ -1,8 +1,0 @@
-{
-  "task1_conv2d_relu": "Task 1 Conv2D + ReLU checksum: 7321.852051\n",
-  "task2_simple_rnn": "Task 2 Simple RNN checksum: -59.690754\n",
-  "task3_mlp_two_layer": "Task 3 Two-Layer MLP checksum: -61.348606\n",
-  "task4_multihead_attention": "Task 4 Transformer Encoder Layer checksum: 102.471481\n",
-  "task5_bfs_graph": "Task 5 PageRank: nodes=8192  edges=59352  dangling=787  iters=14  residual=6.50e-07\nTop-5 nodes: [5562]=0.000389 [6813]=0.000367 [4697]=0.000345 [4206]=0.000339 [2151]=0.000338 \nTask 5 PageRank checksum: 4084.040791\n",
-  "task6_kmeans": "Task 6 Spectral Clustering: building k-NN graph (1024 pts, dim=16, k=10)...\n  Running power iteration (K_eigen=8, iters=30)...\n  Running K-Means on spectral embedding (k=8, iters=40)...\n  Cluster sizes: 128 128 128 128 128 128 128 128\nTask 6 Spectral Clustering eigenvector checksum: 5720.752158\nTask 6 Spectral Clustering label checksum: 1839360\n"
-}
