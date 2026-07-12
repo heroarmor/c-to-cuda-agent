@@ -43,6 +43,10 @@ explain.md
 dataset_zyj/bin/
 dataset_zyj/data/
 
+# rzx agent workflow: per-run progress logs
+# (AGENTS.md itself is tracked -- opencode.json references it as instructions)
+progress/
+
 # opencode: track config + custom commands, ignore local deps/state
 .opencode/node_modules/
 .opencode/package.json

@@ -31,6 +31,7 @@ allocates / copies / launches. Good first demos.
 | N-body | `easy/nbody/nbody.c` | All-pairs O(N²) force loop; high arithmetic intensity |
 | Rendering | `easy/rendering/mandelbrot.c` | Per-pixel escape-time; thread divergence |
 | Monte Carlo | `easy/montecarlo/mc_pi.c` | Per-stream RNG + final reduction |
+| Image processing | `easy/image/sobel.c` | 2D Sobel edge detector; one thread per pixel with fixed 3×3 stencil |
 
 ### moderate/ — tiling / multi-kernel orchestration / recurrence
 
@@ -45,6 +46,8 @@ several kernels and reductions, **or** a time recurrence with resident state.
 | PDE / stencil | `moderate/pde/wave2d.c` | Wave equation; stencil with 3-level time recurrence |
 | Tensor algebra | `moderate/tensor/tensor_contraction.c` | Multi-index contraction; fuse transpose with the GEMM |
 | Rendering | `moderate/rendering/raytrace.c` | Per-pixel with branchy control flow (hits, shadow rays) |
+| Signal processing | `moderate/signal/fft1d.c` | Iterative radix-2 FFT; bit reversal and staged butterfly dependencies |
+| Graph analytics | `moderate/graph/pagerank.c` | PageRank on CSR graph; sparse traversal plus per-iteration reductions |
 
 ### complex/ — data dependencies, irregular structure, hierarchy
 
@@ -59,12 +62,14 @@ blocks, or a multi-level recursive control structure.
 | Sparse linear algebra | `complex/sparse-linalg/spgemm.c` | Sparse×sparse; symbolic pass + irregular merge, load imbalance |
 | Eigen / SVD | `complex/eigen/jacobi_eigen.c` | Symmetric eigenvalues via cyclic Jacobi (one-sided → GPU SVD) |
 | Multigrid / AMG | `complex/multigrid/multigrid.c` | Grid hierarchy: smooth + restrict/prolong, recursive V-cycle |
+| Geometry / proximity | `complex/geometry/pqp.c` | PQP-style triangle-mesh proximity queries; BVH traversal + irregular pruning |
 | Selected inversion / NEGF | `complex/physics/rgf.c` | **Diagonal of a matrix inverse** (Green's function); sequential block sweep + batched B×B GEMM/inverse |
 | Rendering (global illum.) | `complex/rendering/pathtrace.c` | Monte Carlo path tracer (Cornell box); divergent paths, Russian roulette, recursion → bounce loop |
 | Lattice QCD | `complex/lattice-qcd/dslash.c` | Wilson–Dirac stencil with SU(3) complex links + CG on D†D |
 | CFD (lattice Boltzmann) | `complex/cfd/lbm.c` | D2Q9 collide+stream; Taylor–Green vortex on a periodic torus |
 | Quantum computing | `complex/quantum/statevector.c` | Gate circuit on a 2ⁿ state vector; stride-by-qubit gather/scatter |
 | Quantum many-body | `complex/manybody/lanczos.c` | Matrix-free Lanczos on a 2ᴺ Heisenberg Hamiltonian |
+| Bioinformatics | `complex/bio/needleman_wunsch.c` | Global sequence alignment DP; anti-diagonal wavefront dependencies |
 
 ## Self-verification
 
