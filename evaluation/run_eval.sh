@@ -113,8 +113,8 @@ for r in rels:
 # 3 & 4 pointers
 o.append("\n## 3. Code Generation Time\n")
 o.append("Collected separately (uses the model): `evaluation/scripts/codegen_time.sh` "
-         "reports opencode `/cudaify` wall-clock + output tokens per workload "
-         "(file is snapshotted and restored).\n")
+         "reports the `agent_pipeline/run_pipeline.py` wall-clock + output tokens per "
+         "workload (output goes to generated/, so tracked cuda/*.cu is untouched).\n")
 o.append("\n## 4. Hardware Utilization\n")
 o.append("Collected separately: `evaluation/scripts/hw_util.sh <rel> <full-args>` samples "
          "nvidia-smi (avg/peak GPU util, peak mem, peak power). For achieved occupancy / "

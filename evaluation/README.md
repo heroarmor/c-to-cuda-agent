@@ -37,10 +37,11 @@ faster than the CPU baseline), `fast_2`, and the **geometric-mean speedup** over
 correct conversions. Collected by `run_eval.sh`.
 
 ### 3. Code Generation Time  *(agent metric; beyond KernelBench)*
-Wall-clock + output tokens for opencode's `/cudaify` to generate each
-conversion. `scripts/codegen_time.sh` times a regeneration and reads token
-usage from opencode's SQLite store, **snapshotting and restoring** the verified
-`.cu` so nothing is clobbered.
+Wall-clock + output tokens for zyj's agent pipeline
+(`agent_pipeline/run_pipeline.py`) to produce each conversion.
+`scripts/codegen_time.sh` times the pipeline and reads token usage from
+opencode's SQLite store. The pipeline writes to `generated/`, so the tracked
+`cuda/*.cu` conversions are never clobbered.
 
 ### 4. Hardware Utilization
 `scripts/hw_util.sh <rel> <args>` runs the GPU binary while polling

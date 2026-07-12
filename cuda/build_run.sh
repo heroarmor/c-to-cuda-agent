@@ -38,7 +38,7 @@ BIN_C="$HERE/bin/$REL.cpu"
 BIN_CU="$HERE/bin/$REL.gpu"
 
 [ -f "$SRC_C" ]  || { echo "missing CPU reference: $SRC_C" >&2; exit 1; }
-[ -f "$SRC_CU" ] || { echo "missing CUDA conversion: $SRC_CU  (run /cudaify first)" >&2; exit 1; }
+[ -f "$SRC_CU" ] || { echo "missing CUDA conversion: $SRC_CU  (generate it with agent_pipeline/run_pipeline.py first)" >&2; exit 1; }
 
 mkdir -p "$(dirname "$BIN_C")"
 
