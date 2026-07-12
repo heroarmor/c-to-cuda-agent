@@ -151,9 +151,17 @@ Wiring constraints (from the existing pipeline, both deliberate):
   zero-token pipeline. Planning is pure and tested (`test_compiler_moves.py`,
   fake-toolchain gate tests). Still open: GPU validation, and per-move
   reporting in `evaluation/` (each iteration carries an `optimize_move` tag).
-- **Phase 3 — Hybrid (bucket B)** — for `lu`/`qr`/`multigrid`/`lbm`/`rgf`, let
-  PPCG generate the affine sub-kernel and the LLM stitch the host/irregular glue;
-  optionally feed PPCG's dependence/tiling analysis to the LLM as hints.
+- **Phase 3 — Hybrid (bucket B)** ✅ *(pipeline side)* — `run_pipeline.py
+  --backend hybrid` (auto-routed via `mode=hybrid` entries in
+  `scop_targets.json`, checked *before* the prefilter, whose `reject` on
+  recursion/pivoting is what bucket B looks like): PPCG GPU-ifies only the
+  listed affine sub-kernels into `<name>_ppcg_partial.cu`, and the generate
+  agent builds the full translation on top of it — the partial artifact *is*
+  the dependence/tiling hint. First targets: `multigrid`
+  (smoother/restrict/prolong; the recursive V-cycle stays glue) and `rgf`
+  (block GEMMs; the sequential sweep + pivoted inverse stay glue).
+  `lu`/`qr`/`lbm` need region-level scop markers inside one function (`--fn`
+  marks whole bodies only) and stay LLM for now. GPU validation pending.
 
 ## Risks
 

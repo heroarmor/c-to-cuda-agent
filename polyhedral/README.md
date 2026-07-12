@@ -26,11 +26,25 @@ Through the agent pipeline (the PPCG→LLM relay — PPCG supplies the initial
 ```sh
 python3 agent_pipeline/run_pipeline.py benchmark/easy/dense-linalg/gemm.c --backend ppcg
 python3 agent_pipeline/run_pipeline.py some.c --backend auto   # prefilter-routed, LLM fallthrough
+python3 agent_pipeline/run_pipeline.py benchmark/complex/multigrid/multigrid.c --backend hybrid
 ```
 
-`pipeline_result.json` records `"backend": "ppcg" | "llm"` (and, in auto mode,
-`ppcg_fallthrough` with the reason PPCG passed) so `evaluation/` can report
-metrics per backend; a PPCG generate costs zero model tokens.
+`hybrid` is the bucket-B relay (Phase 3): PPCG GPU-ifies only the affine
+sub-kernels named in `scop_targets.json`'s `mode=hybrid` entries (e.g.
+`multigrid`'s smoother/restrict/prolong, `rgf`'s block GEMMs), the partial
+`.cu` lands in the workdir as `<name>_ppcg_partial.cu`, and the generate
+*agent* then builds the full translation on top of it — keeping PPCG's
+kernels, hoisting the per-call copies so device data stays resident across
+the recursive/pivoted host control, and stitching the rest. In `auto` mode a
+`mode=hybrid` entry routes there before the prefilter (whose `reject` on
+recursion is exactly what bucket B looks like); a PPCG reject falls through
+to the plain LLM prompt.
+
+`pipeline_result.json` records `"backend": "ppcg" | "hybrid" | "llm"` (and,
+in auto mode, `ppcg_fallthrough`/`hybrid_fallthrough` with the reason PPCG
+passed) so `evaluation/` can report metrics per backend; a PPCG generate
+costs zero model tokens, a hybrid generate costs one agent call over a much
+smaller stitching problem.
 
 ## Status
 
@@ -40,7 +54,14 @@ metrics per backend; a PPCG generate costs zero model tokens.
 - **Phase 2 — relay + dispatcher**: done. `--backend ppcg|auto` in
   `run_pipeline.py`; `auto` = prefilter triage → PPCG attempt → LLM fallthrough
   (pet is the authority: a `scop-likely` file PPCG rejects falls through cleanly).
-- **Phase 3 — hybrid (bucket B)**: not started.
+- **Phase 3 — hybrid (bucket B)**: pipeline side done. `--backend hybrid`
+  (or `auto` via `mode=hybrid` entries in `scop_targets.json`) runs
+  `_ppcg_partial` → hybrid generate prompt; `multigrid` and `rgf` are the
+  first two targets (`lu`/`qr`/`lbm` need region-level scop markers inside a
+  single function — `--fn` can only mark whole bodies — and stay LLM for
+  now). Not yet GPU-validated, and the two `scop_targets.json` hybrid entries
+  are unverified against real pet (a reject falls through to LLM, so they're
+  safe to list).
 
 Known limits: the merged `.cu` reallocs/copies device buffers on every hot-
 function call (visible in `heat2d`'s per-step H2D/D2H) — a correct but naive

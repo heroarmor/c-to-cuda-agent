@@ -44,15 +44,24 @@ profile call then failed) and still exports the best .cu produced so far
 -- see exit_reason values ending in "_error" in the written
 pipeline_result.json, and HARD_ERROR_EXIT_REASONS below.
 
-The initial .cu can come from either of two backends (--backend):
-  llm   (default) the cuda-generate opencode agent, as before.
-  ppcg  the polyhedral backend: polyhedral/ppcg_to_cu.py runs PPCG on the C
-        source and emits a correct-by-construction, zero-token .cu, which
-        then enters the same verify -> profile -> optimize loop unchanged
-        (the PPCG->LLM relay of polyhedral/DESIGN.md).
-  auto  polyhedral/prefilter.py triages the source; non-rejects attempt
-        PPCG first and fall through to the LLM generate stage if PPCG
-        can't extract a SCoP -- the relay degrades gracefully.
+The initial .cu can come from three backends (--backend):
+  llm     (default) the cuda-generate opencode agent, as before.
+  ppcg    the polyhedral backend: polyhedral/ppcg_to_cu.py runs PPCG on the C
+          source and emits a correct-by-construction, zero-token .cu, which
+          then enters the same verify -> profile -> optimize loop unchanged
+          (the PPCG->LLM relay of polyhedral/DESIGN.md).
+  hybrid  the bucket-B relay (polyhedral/DESIGN.md Phase 3): PPCG GPU-ifies
+          only the affine sub-kernels (the mode=hybrid entries in
+          polyhedral/scop_targets.json), and the cuda-generate agent then
+          builds the full translation on top of that partial artifact --
+          keeping PPCG's kernels, hoisting per-call copies so device data
+          stays resident across the irregular/sequential host control, and
+          translating the remaining glue.
+  auto    scop_targets.json mode=hybrid entries route to the hybrid relay;
+          otherwise polyhedral/prefilter.py triages the source and
+          non-rejects attempt full PPCG. Either compiler path falls through
+          to the plain LLM generate stage when PPCG can't extract a SCoP --
+          the relay degrades gracefully.
 
 An iteration's optimize slot can likewise be taken by a deterministic,
 orchestrator-side compiler move instead of the cuda-optimize agent
@@ -104,9 +113,12 @@ WORKDIR_TOOLS = [COMPARE_SCRIPT, TIME_BINARY_SCRIPT, NCU_CONFIG_FILE]
 # Polyhedral backend (PPCG relay -- see polyhedral/DESIGN.md). run_pipeline.py
 # stays dataset-agnostic: it only ever hands the wrapper one C file; hot-
 # function knowledge lives in polyhedral/scop_targets.json, consulted by the
-# wrapper itself.
+# wrapper itself. The orchestrator reads scop_targets.json too, but only for
+# routing metadata (which entries are mode=hybrid, and which functions to name
+# in the hybrid generate prompt) -- never to decide what is affine.
 PPCG_WRAPPER = ROOT_DIR / "polyhedral" / "ppcg_to_cu.py"
 PREFILTER = ROOT_DIR / "polyhedral" / "prefilter.py"
+SCOP_TARGETS = ROOT_DIR / "polyhedral" / "scop_targets.json"
 
 DEFAULT_MODEL = "deepseek/deepseek-chat"
 DEFAULT_TIMEOUT_SEC = 600
@@ -143,9 +155,27 @@ STAGE_AGENT = {
 }
 
 
-def stage_prompt(stage: str, c_filename: str) -> str:
+def stage_prompt(stage: str, c_filename: str, hybrid: dict | None = None) -> str:
     if stage == "generate":
-        return f"Translate the C program in {c_filename} into CUDA, following your instructions."
+        prompt = f"Translate the C program in {c_filename} into CUDA, following your instructions."
+        if hybrid:
+            # The bucket-B relay (polyhedral/DESIGN.md Phase 3): the partial
+            # artifact IS the hint -- PPCG's kernels carry its dependence and
+            # tiling analysis, so the agent starts from a correct sub-kernel
+            # instead of re-deriving the parallelization itself.
+            fns = hybrid.get("fns") or "the affine sub-kernels PPCG could extract"
+            prompt += (
+                f" A partial translation produced by a polyhedral compiler (PPCG) is already "
+                f"present in {hybrid['partial_file']}: the affine sub-kernel function(s) {fns} "
+                f"have been rewritten as correct-by-construction CUDA kernels with their own "
+                f"launch and host<->device copy wrappers, while all surrounding control flow "
+                f"(the irregular/sequential glue) is still the original host C code. Build on "
+                f"that partial artifact instead of starting from scratch: keep PPCG's kernel "
+                f"bodies and launch configurations unless they are actually wrong, hoist the "
+                f"per-call cudaMalloc/cudaMemcpy out of the wrappers so device data stays "
+                f"resident across the outer control flow, and translate (or deliberately keep "
+                f"on the host) the remaining glue.")
+        return prompt
     if stage == "verify":
         return "Review the current CUDA translation now, following your instructions."
     if stage == "profile":
@@ -268,6 +298,46 @@ def _build_and_run_baseline(workdir: Path, c_filename: str, name: str) -> dict:
     return baseline
 
 
+def _scop_entry(c_filename: str) -> dict | None:
+    """The polyhedral/scop_targets.json entry for this source basename, or
+    None. Read defensively: a missing/broken file just means "no routing
+    metadata", never a pipeline failure."""
+    try:
+        return json.loads(SCOP_TARGETS.read_text(encoding="utf-8")).get(c_filename)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _wants_hybrid(backend: str, entry: dict | None) -> bool:
+    """The bucket-B relay applies when forced (--backend hybrid) or when auto
+    routing hits a scop_targets.json entry marked mode=hybrid. Checked before
+    the prefilter on purpose: bucket-B programs are exactly the ones whose
+    glue (recursion, pivoting, data-dependent control) makes the prefilter
+    say reject even though an affine sub-kernel is worth GPU-ifying."""
+    return backend == "hybrid" or (
+        backend == "auto" and entry is not None and entry.get("mode") == "hybrid")
+
+
+def _ppcg_partial(workdir: Path, c_filename: str, name: str, timeout_sec: float):
+    """The hybrid relay's compiler half: run PPCG (via the wrapper, which
+    consults scop_targets.json for the sub-kernel #pragma scop markers) and
+    keep the result as a *partial* artifact for the generate agent to build
+    on -- NOT as the translation itself, which is what _ppcg_generate does
+    for bucket-A programs. Returns (partial_filename | None, reason)."""
+    if not PPCG_WRAPPER.is_file():
+        return None, "polyhedral/ppcg_to_cu.py not found"
+    partial_file = f"{name}_ppcg_partial.cu"
+    proc = subprocess.run(
+        [sys.executable, str(PPCG_WRAPPER), c_filename, "-o", partial_file],
+        cwd=workdir, capture_output=True, text=True, encoding="utf-8",
+        timeout=timeout_sec,
+    )
+    if proc.returncode != 0 or not (workdir / partial_file).is_file():
+        reason = (proc.stderr or proc.stdout or "").strip().splitlines()
+        return None, "ppcg: " + (reason[-1] if reason else f"rc={proc.returncode}")
+    return partial_file, None
+
+
 def _prefilter_verdict(source: Path) -> str:
     """Run polyhedral/prefilter.py on the source; any problem running it just
     means "no triage available", not "reject" -- pet is the authority anyway."""
@@ -363,12 +433,17 @@ def run_pipeline(
     for extra in extra_files or []:
         shutil.copy(extra, workdir / extra.name)
 
+    # Set by the hybrid routing below before the generate stage ever runs;
+    # read late-bound inside call() so the generate prompt can point the agent
+    # at PPCG's partial artifact when the hybrid relay produced one.
+    hybrid_info = None
+
     def call(stage: str, session_id: str | None, iteration: int | None = None) -> str | None:
         # iteration suffix keeps each loop pass's log distinct -- verify/profile/
         # optimize each run once per iteration, and without it every iteration
         # after the first would silently overwrite the previous one's log.
         log_name = f"{stage}.log" if iteration is None else f"{stage}_iter{iteration}.log"
-        prompt = stage_prompt(stage, c_filename)
+        prompt = stage_prompt(stage, c_filename, hybrid_info if stage == "generate" else None)
         proc, new_session_id = run_stage(stage, prompt, workdir, model, timeout_sec, session_id)
         (run_dir / log_name).write_text(
             f"$ {' '.join(['bun', 'dev', 'run', prompt, '--agent', STAGE_AGENT[stage]])}\n\n"
@@ -425,7 +500,24 @@ def run_pipeline(
     session_id = None
     generate_result = None
     result["backend"] = "llm"
-    if backend in ("ppcg", "auto"):
+    entry = _scop_entry(c_filename)
+    if _wants_hybrid(backend, entry):
+        # The bucket-B relay (polyhedral/DESIGN.md Phase 3): PPCG GPU-ifies
+        # only the affine sub-kernels, then the generate *agent* still runs --
+        # with a prompt pointing it at the partial artifact -- to stitch the
+        # irregular/sequential glue and hoist per-call copies. Unlike the
+        # bucket-A path below, PPCG's output here is never the translation
+        # itself. A PPCG reject falls through to the plain LLM prompt.
+        try:
+            partial_file, hybrid_reason = _ppcg_partial(workdir, c_filename, name, timeout_sec)
+        except subprocess.TimeoutExpired as exc:
+            partial_file, hybrid_reason = None, f"ppcg: {exc}"
+        if partial_file is not None:
+            hybrid_info = {"partial_file": partial_file, "fns": (entry or {}).get("fn")}
+            result["backend"] = "hybrid"
+        else:
+            result["hybrid_fallthrough"] = hybrid_reason
+    elif backend in ("ppcg", "auto"):
         verdict = _prefilter_verdict(source) if backend == "auto" else "scop-likely"
         if verdict != "reject":
             try:
@@ -586,9 +678,11 @@ def main():
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_SEC, help="per-stage-call timeout in seconds")
     parser.add_argument("--max-iterations", type=int, default=DEFAULT_MAX_ITERATIONS, help="hard cap on verify/profile/optimize loop iterations")
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR, help=f"where to copy the final .cu (default: {DEFAULT_OUTPUT_DIR})")
-    parser.add_argument("--backend", choices=("llm", "ppcg", "auto"), default="llm",
+    parser.add_argument("--backend", choices=("llm", "ppcg", "hybrid", "auto"), default="llm",
                         help="who produces the initial .cu: the cuda-generate agent (llm), "
-                             "PPCG polyhedral codegen (ppcg), or prefilter-routed PPCG with "
+                             "PPCG polyhedral codegen (ppcg), PPCG on the affine sub-kernels "
+                             "with the generate agent stitching the glue (hybrid), or "
+                             "scop_targets/prefilter-routed dispatch across all three with "
                              "LLM fallthrough (auto)")
     parser.add_argument("--optimizer", choices=("llm", "compiler", "hybrid"), default="llm",
                         help="who takes each iteration's optimize slot: the cuda-optimize "
