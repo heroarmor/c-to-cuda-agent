@@ -37,9 +37,14 @@ If the command times out or exits with a crash (non-zero exit from a signal, "il
 
 ## Step 3: Compare
 
-Use the comparison tool rather than reading the two output files yourself:
+Programs in this dataset print their own wall-clock fields (`time=0.123 s`, sometimes `(12.3 GFLOP/s)`), which legitimately differ between the C baseline and the CUDA run -- strip them from both sides first, or every comparison reports a false mismatch:
 ```
-python3 compare_outputs.py baseline_output.txt cuda_output.txt
+sed -E 's/ *time=[0-9.eE+-]+ s//; s/ *\([0-9.eE+-]+ GFLOP\/s\)//' baseline_output.txt > baseline_stripped.txt
+sed -E 's/ *time=[0-9.eE+-]+ s//; s/ *\([0-9.eE+-]+ GFLOP\/s\)//' cuda_output.txt > cuda_stripped.txt
+```
+Then use the comparison tool rather than reading the two output files yourself:
+```
+python3 compare_outputs.py baseline_stripped.txt cuda_stripped.txt
 ```
 It prints `MATCH` and exits 0 if the outputs agree (numbers compared with tolerance, not exact text), or `MISMATCH: <reason>` and exits 1 if they don't.
 

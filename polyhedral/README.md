@@ -72,16 +72,22 @@ smaller stitching problem.
   twice; all four candidates were honestly rejected (< 5% win — at n=512 the
   per-call copies dominate, exactly the known-limits story below). The full
   loop with LLM verify/profile stages still needs an opencode setup.
-- **Phase 3 — hybrid (bucket B)**: pipeline side done, partials GPU-verified.
+- **Phase 3 — hybrid (bucket B)**: done and exercised end-to-end on GPU.
   `--backend hybrid` (or `auto` via `mode=hybrid` entries in
   `scop_targets.json`) runs `_ppcg_partial` → hybrid generate prompt. Both
-  first targets pass the golden diff as complete programs: `multigrid`
-  (`smooth_rb`+`prolong_add`, 10 kernels; `residual` excluded — `return`
-  inside the would-be scop; `restrict_fw` excluded — flat memset loop) and
-  `rgf` (`mat_mul`, 2 kernels; `mat_sub` excluded — `B*B` bound is a
-  parameter product, non-affine). The LLM stitching step itself still needs
-  an opencode setup. `lu`/`qr`/`lbm` need region-level scop markers and stay
-  LLM for now.
+  first targets' partials pass the golden diff as complete programs:
+  `multigrid` (`smooth_rb`+`prolong_add`, 10 kernels; `residual` excluded —
+  `return` inside the would-be scop; `restrict_fw` excluded — flat memset
+  loop) and `rgf` (`mat_mul`, 2 kernels; `mat_sub` excluded — `B*B` bound is
+  a parameter product, non-affine). Full-pipeline run on `multigrid`
+  (`--backend hybrid --optimizer hybrid`, free zen model
+  `opencode/deepseek-v4-flash-free`, 5 iterations, 46 min, zero cost): all
+  verifies PASS, optimize slots alternated compiler flags (2 accepted:
+  `maxrregcount=64`, `dlcm=cg`) with LLM moves (`KernelFusion` was the big
+  win), 0.436s → 0.272s (best-version tracking exported iteration 3, not 5).
+  Final honest bottleneck: GPU compute is 1.15% of wall — CUDA driver init
+  (~80 ms) alone exceeds the whole 29 ms C run at this problem size.
+  `lu`/`qr`/`lbm` need region-level scop markers and stay LLM for now.
 
 Known limits: the merged `.cu` reallocs/copies device buffers on every hot-
 function call — a correct but naive starting point by design; hoisting

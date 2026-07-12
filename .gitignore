@@ -61,3 +61,7 @@ polyhedral/toolchain/
 polyhedral/toolchain-build.log
 polyhedral/verify-gpu.log
 polyhedral/moves-smoke.log
+
+# opencode dev checkout the pipeline drives via `bun dev run` (clone of
+# github.com/sst/opencode next to the repo -- see agent_pipeline/ARCHITECTURE.md)
+/opencode/
