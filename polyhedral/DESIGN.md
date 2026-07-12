@@ -87,12 +87,14 @@ relay degrades gracefully.
 
 - **Phase 0 — SCoP classification** ✅ *(this directory)* — coverage measured
   before investing. Result over 41 programs: 34% own (A), 20% hybrid (B), 46% LLM (C).
-- **Phase 1 — PPCG codegen path** — build PPCG; wrap it to take `benchmark/<rel>.c`
-  and emit a verified `.cu`; get `saxpy`, `heat2d`, `gemm` passing the existing
-  `verify` + golden diff. (Needs GPU/LLVM box.)
-- **Phase 2 — Relay + dispatcher** — pre-filter + `pet` routing; feed PPCG output
-  into zyj's `verify → profile → optimize` loop as the `generate` product;
-  `evaluation/` reports per-backend `fast_1` / geomean / codegen-cost.
+- **Phase 1 — PPCG codegen path** ✅ — `build_ppcg.sh` (PPCG 0.09.3 + isl 0.28 +
+  pet 0.11.9 against the `llvm/14.0.6` module) and the `ppcg_to_cu.py` wrapper
+  emitting one self-contained `.cu`; `saxpy`, `heat2d`, `gemm` PASS the golden
+  diff on an RTX PRO 6000 (`verify_gpu.sbatch`). See `README.md` for usage.
+- **Phase 2 — Relay + dispatcher** ✅ *(pipeline side)* — `run_pipeline.py
+  --backend ppcg|auto`: `prefilter.py` triage → PPCG attempt → LLM fallthrough;
+  `pipeline_result.json` carries a `backend` tag. Still open: `evaluation/`
+  reporting per-backend `fast_1` / geomean / codegen-cost from that tag.
 - **Phase 3 — Hybrid (bucket B)** — for `lu`/`qr`/`multigrid`/`lbm`/`rgf`, let
   PPCG generate the affine sub-kernel and the LLM stitch the host/irregular glue;
   optionally feed PPCG's dependence/tiling analysis to the LLM as hints.

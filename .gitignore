@@ -55,3 +55,8 @@ generated/
 agent_pipeline/runs/
 test_results/
 dataset_eval/reports/
+
+# polyhedral toolchain build tree (rebuild with polyhedral/build_ppcg.sh)
+polyhedral/toolchain/
+polyhedral/toolchain-build.log
+polyhedral/verify-gpu.log

@@ -44,10 +44,21 @@ profile call then failed) and still exports the best .cu produced so far
 -- see exit_reason values ending in "_error" in the written
 pipeline_result.json, and HARD_ERROR_EXIT_REASONS below.
 
+The initial .cu can come from either of two backends (--backend):
+  llm   (default) the cuda-generate opencode agent, as before.
+  ppcg  the polyhedral backend: polyhedral/ppcg_to_cu.py runs PPCG on the C
+        source and emits a correct-by-construction, zero-token .cu, which
+        then enters the same verify -> profile -> optimize loop unchanged
+        (the PPCG->LLM relay of polyhedral/DESIGN.md).
+  auto  polyhedral/prefilter.py triages the source; non-rejects attempt
+        PPCG first and fall through to the LLM generate stage if PPCG
+        can't extract a SCoP -- the relay degrades gracefully.
+
 Usage:
     python3 run_pipeline.py path/to/program.c
     python3 run_pipeline.py path/to/a.c path/to/b.c
     python3 run_pipeline.py program.c --model deepseek/deepseek-chat --max-iterations 5
+    python3 run_pipeline.py program.c --backend auto
 """
 
 import argparse
@@ -73,6 +84,13 @@ COMPARE_SCRIPT = OPENCODE_CONFIG_DIR / "skill" / "cuda-verification-procedure" /
 TIME_BINARY_SCRIPT = OPENCODE_CONFIG_DIR / "skill" / "cuda-profiling-procedure" / "time_binary.py"
 NCU_CONFIG_FILE = OPENCODE_CONFIG_DIR / "skill" / "cuda-profiling-procedure" / "ncu_metrics.cfg"
 WORKDIR_TOOLS = [COMPARE_SCRIPT, TIME_BINARY_SCRIPT, NCU_CONFIG_FILE]
+
+# Polyhedral backend (PPCG relay -- see polyhedral/DESIGN.md). run_pipeline.py
+# stays dataset-agnostic: it only ever hands the wrapper one C file; hot-
+# function knowledge lives in polyhedral/scop_targets.json, consulted by the
+# wrapper itself.
+PPCG_WRAPPER = ROOT_DIR / "polyhedral" / "ppcg_to_cu.py"
+PREFILTER = ROOT_DIR / "polyhedral" / "prefilter.py"
 
 DEFAULT_MODEL = "deepseek/deepseek-chat"
 DEFAULT_TIMEOUT_SEC = 600
@@ -234,6 +252,47 @@ def _build_and_run_baseline(workdir: Path, c_filename: str, name: str) -> dict:
     return baseline
 
 
+def _prefilter_verdict(source: Path) -> str:
+    """Run polyhedral/prefilter.py on the source; any problem running it just
+    means "no triage available", not "reject" -- pet is the authority anyway."""
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(PREFILTER), str(source)],
+            capture_output=True, text=True, encoding="utf-8", timeout=30,
+        )
+        return json.loads(proc.stdout)["verdict"]
+    except Exception:
+        return "needs-review"
+
+
+def _ppcg_generate(workdir: Path, c_filename: str, name: str, timeout_sec: float):
+    """The polyhedral backend's generate stage: run PPCG (via the wrapper) on
+    the workdir's C file, emitting <name>.cu next to it -- the same contract
+    cuda-generate fulfills, minus the LLM. Writes a generate_result.json so
+    the rest of the loop (and the JSON trail) look identical either way.
+    Returns (generate_result | None, reason)."""
+    if not PPCG_WRAPPER.is_file():
+        return None, "polyhedral/ppcg_to_cu.py not found"
+    output_file = f"{name}.cu"
+    proc = subprocess.run(
+        [sys.executable, str(PPCG_WRAPPER), c_filename, "-o", output_file],
+        cwd=workdir, capture_output=True, text=True, encoding="utf-8",
+        timeout=timeout_sec,
+    )
+    if proc.returncode != 0 or not (workdir / output_file).is_file():
+        reason = (proc.stderr or proc.stdout or "").strip().splitlines()
+        return None, "ppcg: " + (reason[-1] if reason else f"rc={proc.returncode}")
+    generate_result = {
+        "status": "done",
+        "output_file": output_file,
+        "backend": "ppcg",
+        "summary": "PPCG polyhedral codegen (correct-by-construction, zero model tokens)",
+    }
+    (workdir / schemas.RESULT_FILENAMES["generate"]).write_text(
+        json.dumps(generate_result, indent=2), encoding="utf-8")
+    return generate_result, None
+
+
 def _snapshot_best(
     run_dir: Path, workdir: Path, output_file: str, iteration: int, verify_result: dict, profile_result: dict
 ) -> None:
@@ -256,6 +315,7 @@ def run_pipeline(
     runs_dir: Path = RUNS_DIR,
     output_dir: Path = DEFAULT_OUTPUT_DIR,
     extra_files: list[Path] | None = None,
+    backend: str = "llm",
 ) -> dict:
     """Run the full generate->verify->profile->optimize pipeline on one sequential C file.
 
@@ -328,9 +388,34 @@ def run_pipeline(
         return finish("baseline_error", str(exc))
     result["baseline"] = baseline
 
-    session_id, generate_result, error = call_and_read("generate", None)
-    if error is not None:
-        return finish("generate_error", error)
+    # Backend routing (the PPCG->LLM relay, polyhedral/DESIGN.md): a SCoP gets
+    # its initial .cu from PPCG -- deterministic, correct by construction,
+    # zero model tokens -- and everything downstream (verify -> profile ->
+    # optimize) runs unchanged on it. Anything PPCG can't take falls through
+    # to the cuda-generate agent (in auto mode) or fails the run (ppcg mode).
+    session_id = None
+    generate_result = None
+    result["backend"] = "llm"
+    if backend in ("ppcg", "auto"):
+        verdict = _prefilter_verdict(source) if backend == "auto" else "scop-likely"
+        if verdict != "reject":
+            try:
+                generate_result, ppcg_reason = _ppcg_generate(workdir, c_filename, name, timeout_sec)
+            except subprocess.TimeoutExpired as exc:
+                generate_result, ppcg_reason = None, f"ppcg: {exc}"
+        else:
+            ppcg_reason = f"prefilter verdict: {verdict}"
+        if generate_result is not None:
+            result["backend"] = "ppcg"
+        elif backend == "ppcg":
+            return finish("generate_failed", ppcg_reason)
+        else:
+            result["ppcg_fallthrough"] = ppcg_reason
+
+    if generate_result is None:
+        session_id, generate_result, error = call_and_read("generate", None)
+        if error is not None:
+            return finish("generate_error", error)
     result["generate"] = generate_result
 
     if generate_result["status"] != "done":
@@ -426,6 +511,10 @@ def main():
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_SEC, help="per-stage-call timeout in seconds")
     parser.add_argument("--max-iterations", type=int, default=DEFAULT_MAX_ITERATIONS, help="hard cap on verify/profile/optimize loop iterations")
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR, help=f"where to copy the final .cu (default: {DEFAULT_OUTPUT_DIR})")
+    parser.add_argument("--backend", choices=("llm", "ppcg", "auto"), default="llm",
+                        help="who produces the initial .cu: the cuda-generate agent (llm), "
+                             "PPCG polyhedral codegen (ppcg), or prefilter-routed PPCG with "
+                             "LLM fallthrough (auto)")
     args = parser.parse_args()
 
     for src in args.source:
@@ -436,16 +525,18 @@ def main():
 
     results = []
     for src in args.source:
-        print(f"==> {src.name}: running pipeline with {args.model} ...", flush=True)
+        print(f"==> {src.name}: running pipeline with {args.model} (backend={args.backend}) ...", flush=True)
         start = time.monotonic()
         try:
-            result = run_pipeline(src, args.model, args.timeout, args.max_iterations, output_dir=args.output_dir)
+            result = run_pipeline(src, args.model, args.timeout, args.max_iterations,
+                                  output_dir=args.output_dir, backend=args.backend)
         except (RuntimeError, subprocess.TimeoutExpired) as exc:
             print(f"    FAILED: {exc}")
             results.append({"name": src.stem, "exit_reason": "error", "error": str(exc)})
             continue
         elapsed = time.monotonic() - start
-        print(f"    exit_reason={result['exit_reason']} iterations={len(result['iterations'])} in {elapsed:.1f}s")
+        print(f"    exit_reason={result['exit_reason']} backend={result.get('backend', 'llm')} "
+              f"iterations={len(result['iterations'])} in {elapsed:.1f}s")
         results.append(result)
 
     ok_count = sum(1 for r in results if r.get("exit_reason") not in HARD_ERROR_EXIT_REASONS)

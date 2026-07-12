@@ -1,0 +1,6 @@
+{
+  "_comment": "Hot-function map for the PPCG backend, keyed by source basename. Values are the function(s) whose bodies get #pragma scop markers (Phase 0's per-program hot-kernel calls, SCOP_CLASSIFICATION.md). ppcg_to_cu.py consults this when --fn is not given; absent entries fall back to pet autodetect. Only entries verified to produce a compilable .cu belong here.",
+  "saxpy.c": {"fn": "saxpy"},
+  "heat2d.c": {"fn": "step"},
+  "gemm.c": {"fn": "gemm"}
+}
