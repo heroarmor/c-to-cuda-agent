@@ -83,6 +83,52 @@ relay degrades gracefully.
 5. **Build cost.** PPCG + `isl` + `pet` (+ clang/LLVM) is a non-trivial toolchain
    build, and it plus `nvcc` only exist on a GPU box — not in this dev environment.
 
+## Compiler backend in the *optimize* stage
+
+The relay above puts the compiler on the **generate** side only. The same idea
+extends into the `verify → profile → optimize` loop itself, because the optimize
+stage's contract is just "current `.cu` + profile data in, edited `.cu` +
+`optimize_result.json` out" — nothing requires that edit to come from an LLM.
+Three insertion points, cheapest first:
+
+1. **`nvcc` flag search (every program, both backends).** A deterministic
+   sub-step that picks compiler knobs from the measured bottleneck:
+   `--maxrregcount` / `__launch_bounds__` when occupancy is register-limited,
+   `-Xptxas -dlcm=cg` for scattered access, `-use_fast_math` where the
+   tolerance-aware compare permits it. Zero tokens; applies to LLM- and
+   PPCG-generated `.cu` alike. The existing best-version tracking + patience
+   stop already absorb any candidate that regresses.
+2. **PPCG re-tiling for the affine subset (bucket A, later B).** PPCG exposes
+   its schedule through `--sizes` (tile/block/grid), shared-/private-memory
+   flags, and unrolling. For a SCoP program, an "optimize" iteration can mean:
+   pick new parameters from the measured bottleneck (occupancy low → smaller
+   tiles; DRAM throughput low → different block shape), **re-run PPCG from the
+   original C source**, and re-enter `verify`. That is an autotuning loop over
+   a compiler — every candidate is correctness-preserving by construction, so
+   the verify repair budget stays essentially free. The shaping constraint:
+   **PPCG consumes C, not CUDA** — it cannot post-optimize an arbitrary
+   LLM-written `.cu`, only regenerate from the `.c` (which the workdir keeps).
+3. **Hybrid dispatch (compiler move vs. LLM move).** Per iteration the
+   orchestrator chooses: current `.cu` is PPCG-produced and the bottleneck is
+   tiling/launch-shaped → compiler move (2); bottleneck is structural
+   (algorithm choice, kernel fusion, host-transfer overhead) or the program is
+   bucket C → today's LLM move. `evaluation/`'s per-backend reporting then
+   compares the two optimizers for free.
+
+Wiring constraints (from the existing pipeline, both deliberate):
+
+- **`cuda-optimize` has `bash: deny`** — the LLM optimize agent cannot invoke a
+  compiler. Compiler moves therefore live in the **orchestrator**
+  (`run_pipeline.py` dispatches that iteration to a Python function instead of
+  an opencode agent) — consistent with the pipeline's "mechanical signal over
+  agent self-report" philosophy. The function writes the same
+  `optimize_result.json` shape (e.g. `"technique_applied":
+  "ppcg_retile --sizes=..."`), so `schemas.py` and the loop need almost no
+  changes.
+- **The search must be bounded** — a small profile-guided candidate set per
+  iteration, not a grid sweep, or the patience stop (3 iterations without a 5%
+  win) ends the run before a tuner converges.
+
 ## Phases
 
 - **Phase 0 — SCoP classification** ✅ *(this directory)* — coverage measured
@@ -93,6 +139,10 @@ relay degrades gracefully.
 - **Phase 2 — Relay + dispatcher** — pre-filter + `pet` routing; feed PPCG output
   into zyj's `verify → profile → optimize` loop as the `generate` product;
   `evaluation/` reports per-backend `fast_1` / geomean / codegen-cost.
+- **Phase 2.5 — Compiler moves in the optimize loop** — first the `nvcc` flag
+  search (backend-agnostic, cheapest), then PPCG re-tiling for bucket-A
+  programs; orchestrator-side dispatch per "Compiler backend in the *optimize*
+  stage" above. Report tuner moves vs. LLM moves separately in `evaluation/`.
 - **Phase 3 — Hybrid (bucket B)** — for `lu`/`qr`/`multigrid`/`lbm`/`rgf`, let
   PPCG generate the affine sub-kernel and the LLM stitch the host/irregular glue;
   optionally feed PPCG's dependence/tiling analysis to the LLM as hints.
@@ -106,6 +156,15 @@ relay degrades gracefully.
   optimize loop; it won't necessarily beat cuBLAS on `gemm`. Measure, don't assume.
 - **Science-project risk** — timebox Phase 1 to "one verified `saxpy.cu` from
   PPCG" before broadening. Don't let toolchain-building consume the schedule.
+- **Tuner-vs-patience interaction** — a compiler-knob search that explores too
+  slowly reads as stagnation to the patience stop. Keep per-iteration candidate
+  sets small and profile-guided; if a real sweep is ever needed, run it inside
+  one optimize iteration (best-of-K measured mechanically), not across K
+  iterations.
+- **`-use_fast_math` changes numerics** — only admissible because `verify`
+  re-runs the tolerance-aware diff on every iteration; never apply it to the
+  integer-checksum programs (`sobel`, `pagerank`, `needleman_wunsch`, `fft1d`)
+  without checking the checksum still matches.
 
 ## How it plugs into evaluation
 
