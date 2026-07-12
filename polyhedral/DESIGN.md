@@ -1,0 +1,118 @@
+# Polyhedral backend — design
+
+A **deterministic, polyhedral codegen path** for the affine subset of the C→CUDA
+conversion task, integrated with the existing LLM pipeline (`agent_pipeline/`) and
+measured by the existing framework (`evaluation/`). The goal is a **stronger
+converter**, not a new compiler: we *integrate* PPCG rather than build a
+polyhedral engine from scratch.
+
+> Prerequisite reading: `SCOP_CLASSIFICATION.md` (Phase 0) — which programs this
+> backend can address, and why. Across the 29 benchmark + 12 group-dataset
+> programs (41 total): 14 PPCG-own, 8 hybrid, 19 stay LLM.
+
+## Why PPCG, not a hand-rolled IR
+
+Polyhedral analysis, scheduling (Pluto), tiling, and CUDA emission are a
+multi-person-year body of work already realized in **PPCG** (built on `isl` +
+`pet`/clang). Re-implementing even a slice of it is out of scope for this project.
+Our contribution is the **orchestration**: detecting what is affine, routing it to
+PPCG, and *relaying* PPCG's output into the LLM optimize loop — plus the
+cross-backend comparison the `evaluation/` metrics make possible.
+
+## Architecture: PPCG→LLM relay, not either/or
+
+The naive design is a dispatcher that sends affine programs to PPCG and everything
+else to the LLM (mutually exclusive). We can do better for the affine subset:
+
+```
+             ┌─ SCoP? ──yes──►  PPCG generate  ─┐
+  C source ──┤  (classifier)                    ├─►  verify → profile → optimize  ─► .cu
+             └─ no ──────────►  LLM  generate  ─┘        (zyj's existing loop)
+```
+
+For a SCoP, **PPCG produces the initial `.cu` that would otherwise come from the
+`cuda-generate` agent**, then that `.cu` enters zyj's existing
+`verify → profile → optimize` loop unchanged. Benefits stack:
+
+- **Correct starting point** — polyhedral transforms are correctness-preserving by
+  construction; the `verify` stage's repair budget is essentially free.
+- **Strong starting point** — PPCG's auto-tiling is a real kernel, not an LLM
+  first draft; the `optimize` loop climbs from a higher floor.
+- **Zero-token generation** — the affine subset costs no model calls to generate
+  (great for the codegen-cost metric).
+- **Everything downstream is reused** — `compare_outputs.py`, golden diff,
+  `verify`/`profile`/`optimize`, and `evaluation/` need no changes.
+
+The non-SCoP path is exactly today's pipeline.
+
+## The dispatcher = the Phase 0 classifier, automated
+
+The routing decision is SCoP detection. Phase 0 did this by hand; the dispatcher
+promotes it to an automated check. Two viable implementations, cheapest first:
+
+1. **Let `pet` decide** — run `pet`/PPCG on the source; if it extracts a SCoP
+   covering the hot region and emits code, route A. This is the ground truth and
+   avoids re-implementing SCoP detection.
+2. **Lightweight pre-filter** — a static scan (via `pycparser` or clang AST) for
+   disqualifiers: indirect subscripts (`x[idx[k]]`), data-dependent loop bounds,
+   `<complex.h>`, recursion, `while` with data-dependent condition. Cheap triage
+   before paying for a PPCG attempt.
+
+Recommended: (2) as a fast pre-filter, (1) as the authority. A program that passes
+the pre-filter but PPCG then rejects simply falls through to the LLM path — the
+relay degrades gracefully.
+
+## Integration seams (the parts that actually bite)
+
+1. **Output conventions differ.** `/cudaify`-style output lives at
+   `cuda/<rel>.cu`; zyj's pipeline writes `generated/<name>/`. PPCG emits its own
+   host+device file with its runtime naming. The PPCG path must **normalize its
+   output** into whichever location the verify harness reads, and keep the host
+   I/O + result-line printing intact so the golden diff still matches.
+2. **Order-sensitive integer checksums stay on the host.** `sobel` (FNV),
+   `pagerank`, `needleman_wunsch`, `fft1d` print integer checksums whose value
+   depends on reduction order. PPCG parallelizes only the SCoP and leaves that
+   non-SCoP tail on the host — which is exactly what preserves the checksum. Float
+   reductions may reorder; the evaluation's tolerance-aware compare absorbs that.
+3. **`<complex.h>` is out of scope for PPCG anyway.** `statevector`/`dslash` are
+   `C-hard` (LLM path); no special handling needed here.
+4. **`pet` needs a clean SCoP region.** Some `A` programs may need a `#pragma scop`
+   marker or minor source normalization (explicit subscripts instead of
+   base-pointer offsets in `tensor_contraction`; the SPD early-`return` in
+   `cholesky`). Phase 1 confirms each against real `pet`.
+5. **Build cost.** PPCG + `isl` + `pet` (+ clang/LLVM) is a non-trivial toolchain
+   build, and it plus `nvcc` only exist on a GPU box — not in this dev environment.
+
+## Phases
+
+- **Phase 0 — SCoP classification** ✅ *(this directory)* — coverage measured
+  before investing. Result over 41 programs: 34% own (A), 20% hybrid (B), 46% LLM (C).
+- **Phase 1 — PPCG codegen path** — build PPCG; wrap it to take `benchmark/<rel>.c`
+  and emit a verified `.cu`; get `saxpy`, `heat2d`, `gemm` passing the existing
+  `verify` + golden diff. (Needs GPU/LLVM box.)
+- **Phase 2 — Relay + dispatcher** — pre-filter + `pet` routing; feed PPCG output
+  into zyj's `verify → profile → optimize` loop as the `generate` product;
+  `evaluation/` reports per-backend `fast_1` / geomean / codegen-cost.
+- **Phase 3 — Hybrid (bucket B)** — for `lu`/`qr`/`multigrid`/`lbm`/`rgf`, let
+  PPCG generate the affine sub-kernel and the LLM stitch the host/irregular glue;
+  optionally feed PPCG's dependence/tiling analysis to the LLM as hints.
+
+## Risks
+
+- **Coverage is a third, not all** — frame PPCG as "deterministic backend for the
+  affine subset," never "replaces the LLM." Phase 0 numbers keep this honest.
+- **PPCG speed ≠ always fastest** — its win is correctness-by-construction +
+  determinism + zero token cost, and being a strong *starting point* for the
+  optimize loop; it won't necessarily beat cuBLAS on `gemm`. Measure, don't assume.
+- **Science-project risk** — timebox Phase 1 to "one verified `saxpy.cu` from
+  PPCG" before broadening. Don't let toolchain-building consume the schedule.
+
+## How it plugs into evaluation
+
+No new harness. Tag each conversion with the backend that produced it
+(`ppcg` / `llm`) and report the existing metrics **per backend**: correctness
+rate, `fast_1`/geomean speedup, and codegen cost (wall-clock + tokens; PPCG =
+0 tokens). The claim the project can then make with data: *"the polyhedral backend
+converts the affine subset with provable correctness at zero model cost, and the
+LLM pipeline covers the irregular long tail — together stronger than either
+alone."*
