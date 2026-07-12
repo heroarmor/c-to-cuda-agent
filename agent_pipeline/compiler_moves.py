@@ -91,6 +91,13 @@ SIZES_LADDER = {
     "wide-x": "{kernel[i]->tile[64,16];kernel[i]->block[64,4]}",
 }
 
+# Benchmarks print their own wall-clock (e.g. "time=0.123 s", gemm adds
+# "(12.34 GFLOP/s)"), which legitimately differs between the C baseline and
+# any CUDA candidate -- strip those fields before diffing, the same convention
+# polyhedral/verify_gpu.sbatch and evaluation/ already use. Without this the
+# mechanical gate rejects every candidate of a time=-printing benchmark.
+_TIMING_FIELD_RE = re.compile(r" *time=[0-9.eE+-]+ s| *\([0-9.eE+-]+ GFLOP/s\)")
+
 _MEMORY_STALLS = ("long_scoreboard", "lg_throttle", "mio_throttle")
 _STALL_KEYWORDS = _MEMORY_STALLS + (
     "short_scoreboard", "barrier", "math_pipe_throttle", "not_selected")
@@ -290,9 +297,15 @@ def _measure_candidate(workdir: Path, cu_filename: str, flags: list,
     if proc.returncode != 0:
         return None, f"run failed (rc={proc.returncode}): {_last_line(proc.stderr)}"
     candidate_output = f"{binary}_output.txt"
-    (workdir / candidate_output).write_text(proc.stdout, encoding="utf-8")
+    (workdir / candidate_output).write_text(
+        _TIMING_FIELD_RE.sub("", proc.stdout), encoding="utf-8")
+    baseline_stripped = "baseline_output_stripped.txt"
+    (workdir / baseline_stripped).write_text(
+        _TIMING_FIELD_RE.sub(
+            "", (workdir / "baseline_output.txt").read_text(encoding="utf-8")),
+        encoding="utf-8")
     proc = subprocess.run(
-        [sys.executable, "compare_outputs.py", "baseline_output.txt",
+        [sys.executable, "compare_outputs.py", baseline_stripped,
          candidate_output],
         cwd=workdir, capture_output=True, text=True, encoding="utf-8",
         timeout=60)

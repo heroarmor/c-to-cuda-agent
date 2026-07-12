@@ -60,25 +60,92 @@ def die(msg, code=1):
     sys.exit(code)
 
 
-def mark_functions(src, names):
-    """Wrap the body statements of each named function in #pragma scop/endscop."""
+def _find_function(src, name):
+    """(match, open_brace, close_brace) for a named function definition.
+    The param list may contain nested parens (delinearized VLA params like
+    `(*A)[n]`), so match greedily up to the last `)` before the brace."""
+    m = re.search(
+        r"^[ \t]*(?:static\s+)?(?:inline\s+)?[A-Za-z_][\w \t\*]*\b%s\s*\([^;{]*\)\s*\{"
+        % re.escape(name), src, re.M)
+    if not m:
+        die("--fn %s: no function definition found" % name)
+    open_brace = m.end() - 1
+    depth, i = 1, m.end()
+    while i < len(src) and depth:
+        depth += {"{": 1, "}": -1}.get(src[i], 0)
+        i += 1
+    return m, open_brace, i - 1
+
+
+def delinearize(src, name, arrays):
+    """Rewrite flat-pointer params of one function into 2D VLA form.
+
+    pet cannot delinearize `p[i * n + j]` on a flat `T *p` (a parameter times
+    an iterator is bilinear, not affine, and the array extent is undecidable
+    -- the reason heat2d/gemm silently produced zero kernels and rgf hard-
+    failed). The equivalent 2D form `T (*p)[n]` with `p[i][j]` is exactly
+    what pet handles, so for each (param -> row-stride) pair in `arrays`:
+      1. the parameter declaration `T *p` becomes `T (*p)[stride]`, and
+      2. every `p[e1 * stride + e2]` access in the body becomes `p[e1][e2]`.
+    Only textually-direct accesses rewrite; anything left over (a flat memset
+    loop, a derived index variable) makes the rewritten source ill-typed and
+    ppcg fails LOUDLY -> the pipeline falls through to the LLM, rather than
+    silently emitting kernel-less host code. Keep such functions out of
+    scop_targets.json (see each entry's _why)."""
+    m, open_brace, close_brace = _find_function(src, name)
+    sig = src[m.start():open_brace]
+    body = src[open_brace:close_brace]
+    for param, stride in arrays.items():
+        new_sig, n = re.subn(
+            r"(\bconst\s+)?(\b(?:float|double|int|long)\b)\s*\*\s*(%s)\b"
+            % re.escape(param),
+            lambda g: "%s%s (*%s)[%s]" % (g.group(1) or "", g.group(2),
+                                          g.group(3), stride),
+            sig, count=1)
+        if not n:
+            continue  # arrays is shared across all marked fns; this param
+                      # simply isn't one of this function's
+        sig = new_sig
+        body = re.sub(
+            r"\b%s\[([^][]+?)\s*\*\s*%s\s*\+\s*([^][]+?)\]"
+            % (re.escape(param), re.escape(stride)),
+            r"%s[\1][\2]" % param, body)
+    return src[:m.start()] + sig + body + src[close_brace:]
+
+
+def mark_functions(src, names, arrays=None):
+    """Wrap the body statements of each named function in #pragma scop/endscop
+    (delinearizing its flat-pointer params first -- see delinearize)."""
     for name in names:
-        m = re.search(
-            r"^[ \t]*(?:static\s+)?(?:inline\s+)?[A-Za-z_][\w \t\*]*\b%s\s*\([^;{)]*\)\s*\{"
-            % re.escape(name), src, re.M)
-        if not m:
-            die("--fn %s: no function definition found" % name)
-        open_brace = m.end() - 1
-        depth, i = 1, m.end()
-        while i < len(src) and depth:
-            depth += {"{": 1, "}": -1}.get(src[i], 0)
-            i += 1
-        close_brace = i - 1
+        if arrays:
+            src = delinearize(src, name, arrays)
+        m, open_brace, close_brace = _find_function(src, name)
         body = src[open_brace + 1 : close_brace]
         src = (src[: open_brace + 1]
                + "\n#pragma scop\n" + body + "\n#pragma endscop\n"
                + src[close_brace:])
     return src
+
+
+def reflatten(merged, arrays):
+    """Undo delinearization in the merged output: nvcc compiles .cu as C++,
+    which has no VLAs, so the 2D `T (*p)[n]` form that pet needed (see
+    delinearize) must not survive into the .cu. PPCG's own kernels and copy
+    code already use flat dev_ pointers; only the host-side signatures (and
+    any statements pet left outside the scop) still carry the VLA type.
+    Reverting the parameter declaration also re-matches the call sites, which
+    always kept passing flat pointers."""
+    for param, stride in arrays.items():
+        merged = re.sub(
+            r"(\bconst\s+)?(\b(?:float|double|int|long)\b)\s*\(\s*\*\s*(%s)\s*\)\s*\[[^]]*\]"
+            % re.escape(param),
+            r"\1\2 *\3", merged)
+        merged = re.sub(
+            r"\b(%s)\[([^][]+)\]\[([^][]+)\]" % re.escape(param),
+            lambda g: "%s[(%s) * (%s) + (%s)]" % (g.group(1), g.group(2),
+                                                  stride, g.group(3)),
+            merged)
+    return merged
 
 
 def merge(stem, tmp):
@@ -113,6 +180,9 @@ def main():
                     help="force pet autodetect even if scop_targets.json has an entry")
     ap.add_argument("--ppcg", default=os.environ.get("PPCG", DEFAULT_PPCG))
     ap.add_argument("--sizes", help="PPCG --sizes string (tile/block/grid)")
+    ap.add_argument("--vla", help="comma-separated param=rowstride pairs to "
+                                  "delinearize in the marked functions "
+                                  "(default: the entry's 'arrays' in scop_targets.json)")
     ap.add_argument("--ppcg-arg", action="append", default=[],
                     help="extra raw ppcg argument (repeatable)")
     ap.add_argument("--timeout", type=int, default=120)
@@ -134,6 +204,9 @@ def main():
     with open(args.input) as f:
         src = f.read()
 
+    arrays = {}
+    if args.vla:
+        arrays = dict(pair.split("=", 1) for pair in args.vla.split(",") if pair)
     if not args.fn and not args.autodetect:
         targets_path = os.path.join(HERE, "scop_targets.json")
         if os.path.isfile(targets_path):
@@ -143,13 +216,16 @@ def main():
                 args.fn = entry["fn"]
                 if entry.get("sizes") and not args.sizes:
                     args.sizes = entry["sizes"]
+                if entry.get("arrays") and not arrays:
+                    arrays = entry["arrays"]
 
     stem = os.path.splitext(os.path.basename(args.input))[0]
     tmp = tempfile.mkdtemp(prefix="ppcg_%s_" % stem)
     try:
         cmd = [args.ppcg, "--target=cuda"]
         if args.fn:
-            src = mark_functions(src, [s.strip() for s in args.fn.split(",") if s.strip()])
+            src = mark_functions(src, [s.strip() for s in args.fn.split(",") if s.strip()],
+                                 arrays)
         else:
             cmd.append("--pet-autodetect")
         if args.sizes:
@@ -177,6 +253,17 @@ def main():
             die("ppcg failed (rc=%d) -- fall through to the LLM backend" % proc.returncode, 3)
 
         merged = CXX_PRELUDE + "\n" + merge(stem, tmp)
+        if arrays:
+            merged = reflatten(merged, arrays)
+        if "__global__" not in merged:
+            # pet found no extractable SCoP (e.g. flat-pointer subscripts it
+            # can't delinearize) and ppcg exited 0 with the input passed
+            # through untouched. Host-only "CUDA" must not count as a
+            # polyhedral conversion -- fail loudly so ppcg/auto/hybrid modes
+            # fall through to the LLM instead of shipping a no-op .cu with a
+            # ppcg backend tag (this is exactly what silently happened to
+            # heat2d and gemm before delinearization support).
+            die("ppcg emitted no kernel -- fall through to the LLM backend", 3)
         header = ("/* Generated by the polyhedral backend (PPCG) from %s.\n"
                   " * Mode: %s. Merged host+kernel translation unit; do not hand-edit\n"
                   " * the kernel launch bounds here -- regenerate or let the optimize\n"

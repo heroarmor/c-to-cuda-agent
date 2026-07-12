@@ -11,6 +11,7 @@ directory now contains the working implementation:
 | `ppcg_to_cu.py` | The backend's generate stage: runs PPCG on one benchmark C file and merges its 3-file output into **one self-contained `.cu`** (host I/O + result line intact), plus a C→C++ compatibility shim so nvcc accepts it. |
 | `scop_targets.json` | Hot-function map (basename → `--fn`) from Phase 0, consulted automatically; unmapped files fall back to pet autodetect. |
 | `verify_gpu.sbatch` | Short Slurm job (gpu-rtx6000): compile + run generated `.cu` vs the C reference, tolerance-aware golden diff with timing fields stripped. |
+| `moves_smoke.py` | GPU smoke test for the Phase 2.5 compiler optimize moves against the real toolchain (nvcc flag search + PPCG re-tiling, no opencode needed); submit with the `sbatch --wrap` line in its docstring. |
 
 ## Quick start
 
@@ -49,21 +50,42 @@ smaller stitching problem.
 ## Status
 
 - **Phase 0 — SCoP classification**: done (`SCOP_CLASSIFICATION.md`).
-- **Phase 1 — PPCG codegen path**: done. `saxpy`, `heat2d`, `gemm` generate and
-  nvcc-compile; GPU golden-diff via `verify_gpu.sbatch`.
+- **Phase 1 — PPCG codegen path**: done, with a correction found during GPU
+  validation: pet cannot delinearize flat-pointer subscripts (`p[i*n+j]` on a
+  `T *p` — bilinear, undecidable extent), so the early "PASS" for `heat2d` and
+  `gemm` was host-only passthrough trivially matching the golden diff.
+  `ppcg_to_cu.py` now (a) delinearizes flat params into 2D VLA form for pet
+  (per-entry `arrays` in `scop_targets.json`), reflattening afterwards for
+  nvcc's C++ mode, and (b) **fails loudly when no `__global__` kernel comes
+  out**, so a passthrough can never again count as a conversion. GPU-verified
+  (RTX PRO 6000, golden diff): `saxpy` (2 kernels), `gemm` (2 kernels,
+  finally real). `heat2d` now falls through honestly — its derived flat index
+  (`int i = y*m+x`) defeats textual delinearization (needs region-level
+  normalization, same club as `lu`/`qr`/`lbm`).
 - **Phase 2 — relay + dispatcher**: done. `--backend ppcg|auto` in
   `run_pipeline.py`; `auto` = prefilter triage → PPCG attempt → LLM fallthrough
   (pet is the authority: a `scop-likely` file PPCG rejects falls through cleanly).
-- **Phase 3 — hybrid (bucket B)**: pipeline side done. `--backend hybrid`
-  (or `auto` via `mode=hybrid` entries in `scop_targets.json`) runs
-  `_ppcg_partial` → hybrid generate prompt; `multigrid` and `rgf` are the
-  first two targets (`lu`/`qr`/`lbm` need region-level scop markers inside a
-  single function — `--fn` can only mark whole bodies — and stay LLM for
-  now). Not yet GPU-validated, and the two `scop_targets.json` hybrid entries
-  are unverified against real pet (a reject falls through to LLM, so they're
-  safe to list).
+- **Phase 2.5 — compiler optimize moves**: mechanical half GPU-verified via
+  `moves_smoke.py` (see `agent_pipeline/ARCHITECTURE.md` for the design): on
+  `gemm`, the flag search compiled/ran/diffed/timed both profile-guided
+  candidates and the retile move regenerated through real PPCG `--sizes`
+  twice; all four candidates were honestly rejected (< 5% win — at n=512 the
+  per-call copies dominate, exactly the known-limits story below). The full
+  loop with LLM verify/profile stages still needs an opencode setup.
+- **Phase 3 — hybrid (bucket B)**: pipeline side done, partials GPU-verified.
+  `--backend hybrid` (or `auto` via `mode=hybrid` entries in
+  `scop_targets.json`) runs `_ppcg_partial` → hybrid generate prompt. Both
+  first targets pass the golden diff as complete programs: `multigrid`
+  (`smooth_rb`+`prolong_add`, 10 kernels; `residual` excluded — `return`
+  inside the would-be scop; `restrict_fw` excluded — flat memset loop) and
+  `rgf` (`mat_mul`, 2 kernels; `mat_sub` excluded — `B*B` bound is a
+  parameter product, non-affine). The LLM stitching step itself still needs
+  an opencode setup. `lu`/`qr`/`lbm` need region-level scop markers and stay
+  LLM for now.
 
 Known limits: the merged `.cu` reallocs/copies device buffers on every hot-
-function call (visible in `heat2d`'s per-step H2D/D2H) — a correct but naive
-starting point by design; hoisting transfers is exactly the optimize loop's
-first move. `--fn` marking assumes the hot function contains no `return`.
+function call — a correct but naive starting point by design; hoisting
+transfers is exactly what the optimize loop / hybrid stitching is for. It is
+also why every GPU-verified conversion currently *loses* to the C baseline
+end-to-end (`gemm` 0.15s vs 0.13s; `rgf`'s 256 tiny per-block launches: 2.6s
+vs 0.02s). `--fn` marking assumes the hot function contains no `return`.

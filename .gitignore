@@ -60,3 +60,4 @@ dataset_eval/reports/
 polyhedral/toolchain/
 polyhedral/toolchain-build.log
 polyhedral/verify-gpu.log
+polyhedral/moves-smoke.log

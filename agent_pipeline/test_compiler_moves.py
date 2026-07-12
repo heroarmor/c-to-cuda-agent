@@ -142,7 +142,7 @@ done
 cat > "$out" <<EOF
 #!/bin/sh
 sleep $sleep
-echo "result 42"
+echo "result 42  time=$sleep s"
 EOF
 chmod +x "$out"
 """
@@ -198,7 +198,11 @@ def _workdir(tmp: Path) -> Path:
     workdir.mkdir()
     shutil.copy(COMPARE, workdir / COMPARE.name)
     shutil.copy(TIME_BIN, workdir / TIME_BIN.name)
-    (workdir / "baseline_output.txt").write_text("result 42\n", encoding="utf-8")
+    # The baseline carries the C program's own time= field (they all print
+    # one); candidates print a different time -- the gate must strip both
+    # before diffing, or every correct candidate would be a "mismatch".
+    (workdir / "baseline_output.txt").write_text(
+        "result 42  time=9.999 s\n", encoding="utf-8")
     (workdir / "prog.cu").write_text("/* current translation */\n", encoding="utf-8")
     return workdir
 

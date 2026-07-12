@@ -1,10 +1,13 @@
 {
-  "_comment": "Hot-function map for the PPCG backend, keyed by source basename. Values are the function(s) whose bodies get #pragma scop markers (Phase 0's per-program hot-kernel calls, SCOP_CLASSIFICATION.md). ppcg_to_cu.py consults this when --fn is not given; absent entries fall back to pet autodetect. Entries without a mode are bucket-A, verified to produce a compilable .cu. mode=hybrid marks bucket-B Phase 3 targets: only the listed affine sub-kernels are GPU-ified, and run_pipeline.py routes the result through the hybrid relay (PPCG partial + LLM glue-stitching) instead of treating it as a complete translation; an entry PPCG rejects just falls through to the plain LLM path, so hybrid entries are safe to list before GPU validation.",
+  "_comment": "Hot-function map for the PPCG backend, keyed by source basename. fn: function(s) whose bodies get #pragma scop markers (Phase 0's per-program hot-kernel calls, SCOP_CLASSIFICATION.md). arrays: flat-pointer params ppcg_to_cu.py delinearizes into 2D VLA form (param -> row stride) -- pet cannot handle p[i*n+j] on a flat T* (bilinear subscript, undecidable extent; it silently emits zero kernels or hard-fails), but handles the equivalent (*p)[n] 2D form. Entries without a mode are bucket-A: PPCG output is the whole translation. mode=hybrid marks bucket-B Phase 3 targets: only the listed affine sub-kernels are GPU-ified and run_pipeline.py routes through the hybrid relay (PPCG partial + LLM glue-stitching). Either way the wrapper now fails loudly when no kernel comes out, so a bad entry falls through to the LLM path instead of shipping host-only code with a ppcg tag.",
   "saxpy.c": {"fn": "saxpy"},
-  "heat2d.c": {"fn": "step"},
-  "gemm.c": {"fn": "gemm"},
-  "multigrid.c": {"fn": "smooth_rb,restrict_fw,prolong_add", "mode": "hybrid",
-                  "_why": "recursive vcycle + per-level alloc stay host/LLM glue; residual() is affine too but its body ends in a return, which pet can't have inside a scop region"},
-  "rgf.c": {"fn": "mat_mul,mat_sub", "mode": "hybrid",
-            "_why": "per-block BxB GEMMs are affine (B is a symbolic parameter); the sequential block sweep and the pivoted mat_inv stay host/LLM glue"}
+  "gemm.c": {"fn": "gemm", "arrays": {"A": "n", "B": "n", "C": "n"}},
+  "heat2d.c": {"fn": "step",
+               "_why": "currently falls through: step() computes a derived flat index (int i = y*m+x; u[i-1], u[i-m]) that textual delinearization can't rewrite -- needs region-level source normalization, same club as lu/qr/lbm"},
+  "multigrid.c": {"fn": "smooth_rb,prolong_add", "mode": "hybrid",
+                  "arrays": {"u": "n", "f": "n", "ec": "nc", "uf": "nf"},
+                  "_why": "recursive vcycle + per-level alloc stay host/LLM glue. residual() excluded (return inside would-be scop); restrict_fw() excluded (flat rc[i]=0 memset over nc*nc defeats textual delinearization)"},
+  "rgf.c": {"fn": "mat_mul", "mode": "hybrid",
+            "arrays": {"A": "B", "Bm": "B", "C": "B"},
+            "_why": "per-block BxB GEMM is affine after delinearization (global B is a pet parameter); the sequential block sweep and pivoted mat_inv stay host/LLM glue. mat_sub() excluded (flat C[i] loop bounded by B*B -- a parameter product, non-affine)"}
 }
