@@ -7,9 +7,9 @@ description: The two-step procedure for profiling a verified CUDA translation --
 
 `baseline_time_sec` is **not** measured here -- the pipeline orchestrator already compiled and ran the original C program exactly once, before generate ever started, and recorded its mean timing in `baseline.json` (already present in the current directory: `{"time_sec": ...}`). Read it from there directly. Never recompile or re-time the C binary yourself -- re-running it repeatedly was found to introduce noise (e.g. cache/warm-up effects) unrelated to the CUDA translation, which is exactly why this is now a single fixed reference instead of a per-iteration measurement.
 
-The `<name>_cuda` binary should already exist in the current directory from the verify stage (same session, same working directory). If it's missing, rebuild it with the same command the verify stage uses:
+The `<name>_cuda` binary should already exist in the current directory from the verify stage (same session, same working directory). If it's missing, rebuild it with the same command the verify stage uses -- including the extra flags from `nvcc_flags.txt` when that file exists (it's written by the pipeline's mechanical compiler tuner; the tuned performance isn't reproducible without those flags, so never omit, edit, or delete it):
 ```
-nvcc -O2 <name>.cu -o <name>_cuda -lm
+nvcc -O2 $(cat nvcc_flags.txt 2>/dev/null) <name>.cu -o <name>_cuda -lm
 ```
 
 Time it with `time_binary.py` (already present in this directory) rather than computing min/mean/median by hand:

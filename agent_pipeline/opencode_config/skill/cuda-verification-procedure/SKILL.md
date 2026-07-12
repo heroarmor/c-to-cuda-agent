@@ -12,14 +12,16 @@ A static code review (see the `cuda-correctness-review` skill) can catch obvious
 ## Step 1: Compile
 
 Only the generated CUDA needs compiling here -- the C reference is already built and run once by the orchestrator (`baseline_output.txt`).
+
+If a file named `nvcc_flags.txt` exists in the current directory, it holds extra nvcc flags chosen by the pipeline's mechanical compiler tuner (an orchestrator-side optimize move). Those flags are part of the artifact being verified -- the tuned time isn't reproducible without them -- so include them in every nvcc invocation, and never edit or delete the file yourself:
 ```
-nvcc -O2 <name>.cu -o <name>_cuda -lm
+nvcc -O2 $(cat nvcc_flags.txt 2>/dev/null) <name>.cu -o <name>_cuda -lm
 ```
 
 If `nvcc` fails with "no kernel image is available for execution on the device", the architecture flags don't match the GPU. Detect the actual compute capability and retry with it:
 ```
 nvidia-smi --query-gpu=compute_cap --format=csv,noheader
-nvcc -O2 -arch=sm_<cc-without-dot> <name>.cu -o <name>_cuda -lm
+nvcc -O2 $(cat nvcc_flags.txt 2>/dev/null) -arch=sm_<cc-without-dot> <name>.cu -o <name>_cuda -lm
 ```
 
 If compilation fails for any other reason, this is a **compile failure** -- stop here and go to the `cuda-repair` skill rather than trying to run anything.

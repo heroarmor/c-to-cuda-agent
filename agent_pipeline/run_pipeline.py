@@ -54,11 +54,26 @@ The initial .cu can come from either of two backends (--backend):
         PPCG first and fall through to the LLM generate stage if PPCG
         can't extract a SCoP -- the relay degrades gracefully.
 
+An iteration's optimize slot can likewise be taken by a deterministic,
+orchestrator-side compiler move instead of the cuda-optimize agent
+(--optimizer; see compiler_moves.py and polyhedral/DESIGN.md's "Compiler
+backend in the *optimize* stage"):
+  llm       (default) every optimize slot goes to the cuda-optimize agent.
+  compiler  compiler moves only, zero optimize tokens: the nvcc flag search
+            first, then PPCG re-tiling (ppcg-produced .cu only); when no
+            untried candidate applies, the run stops with exit_reason
+            "optimizer_exhausted" instead of burning iterations. Combined
+            with --backend ppcg this is a fully deterministic, zero-token
+            pipeline for the affine subset.
+  hybrid    compiler moves while an untried profile-guided candidate
+            remains, then the cuda-optimize agent.
+
 Usage:
     python3 run_pipeline.py path/to/program.c
     python3 run_pipeline.py path/to/a.c path/to/b.c
     python3 run_pipeline.py program.c --model deepseek/deepseek-chat --max-iterations 5
     python3 run_pipeline.py program.c --backend auto
+    python3 run_pipeline.py program.c --backend ppcg --optimizer compiler
 """
 
 import argparse
@@ -72,6 +87,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+import compiler_moves
 import schemas
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
@@ -298,10 +314,16 @@ def _snapshot_best(
 ) -> None:
     """Copy the just-profiled .cu plus its verify/profile results into
     run_dir/best/, overwriting any earlier snapshot -- only the most recent
-    "best" needs to survive, since each new best fully supersedes the last."""
+    "best" needs to survive, since each new best fully supersedes the last.
+    nvcc_flags.txt (the compiler tuner's accepted flag set, when one exists)
+    is part of what was measured -- the .cu alone doesn't reproduce the best
+    time without it -- so it snapshots and exports together with the .cu."""
     best_dir = run_dir / "best"
     best_dir.mkdir(exist_ok=True)
     shutil.copy(workdir / output_file, best_dir / output_file)
+    flags_file = workdir / compiler_moves.NVCC_FLAGS_FILE
+    if flags_file.is_file():
+        shutil.copy(flags_file, best_dir / flags_file.name)
     (best_dir / "verify_result.json").write_text(json.dumps(verify_result, indent=2), encoding="utf-8")
     (best_dir / "profile_result.json").write_text(json.dumps(profile_result, indent=2), encoding="utf-8")
     (best_dir / "meta.json").write_text(json.dumps({"iteration": iteration}, indent=2), encoding="utf-8")
@@ -316,6 +338,7 @@ def run_pipeline(
     output_dir: Path = DEFAULT_OUTPUT_DIR,
     extra_files: list[Path] | None = None,
     backend: str = "llm",
+    optimizer: str = "llm",
 ) -> dict:
     """Run the full generate->verify->profile->optimize pipeline on one sequential C file.
 
@@ -369,7 +392,13 @@ def run_pipeline(
         except (RuntimeError, subprocess.TimeoutExpired, ValueError) as exc:
             return session_id, None, f"{stage}: {exc}"
 
-    result = {"name": name, "source": str(source), "workdir": str(workdir), "iterations": []}
+    result = {"name": name, "source": str(source), "workdir": str(workdir),
+              "optimizer": optimizer, "iterations": []}
+    # Cross-iteration compiler-tuner state: candidates already tried (accepted
+    # or not) and the currently accepted nvcc flag set. Threading it here, in
+    # the orchestrator, is what keeps each optimize slot's candidate set small
+    # (bounded per iteration) without ever re-proposing the same knob.
+    opt_state = compiler_moves.new_state()
 
     def finish(exit_reason: str, error: str | None = None) -> dict:
         # Single exit path so a summary is always written and the best .cu
@@ -466,10 +495,53 @@ def run_pipeline(
             result["iterations"].append(iteration_data)
             return finish("stagnated")
 
-        session_id, optimize_result, error = call_and_read("optimize", session_id, i)
-        if error is not None:
+        # Optimize-slot dispatch (polyhedral/DESIGN.md, "Compiler backend in
+        # the *optimize* stage"): a deterministic compiler move can take this
+        # slot instead of the cuda-optimize agent. Planning is pure; both
+        # paths end in the same schema-validated optimize_result.json, so
+        # everything downstream is move-agnostic. The compiler moves live
+        # here, in the orchestrator, deliberately -- cuda-optimize has
+        # bash:deny, and this pipeline prefers mechanical measurement over
+        # agent self-report anyway.
+        plan = None
+        if optimizer != "llm":
+            cu_path = workdir / output_file
+            cu_text = cu_path.read_text(encoding="utf-8") if cu_path.is_file() else ""
+            plan = compiler_moves.plan_move(
+                optimizer, result["backend"], profile_result, cu_text,
+                opt_state, retile_available=PPCG_WRAPPER.is_file())
+        move = plan.move if plan is not None else "llm"
+        iteration_data["optimize_move"] = move
+
+        if move == "llm":
+            session_id, optimize_result, error = call_and_read("optimize", session_id, i)
+            if error is not None:
+                result["iterations"].append(iteration_data)
+                return finish("optimize_error", error)
+        elif move == "none":
+            # compiler-only mode with nothing left to try: stop now instead
+            # of spending PATIENCE more verify/profile iterations discovering
+            # that nothing is changing. A normal exit, not a hard error.
+            compiler_moves.write_noop_result(
+                workdir, plan, "no untried compiler candidate applies to the "
+                "measured bottleneck; --optimizer compiler has no LLM fallback")
+            iteration_data["optimize"] = read_stage_result(workdir, "optimize")
             result["iterations"].append(iteration_data)
-            return finish("optimize_error", error)
+            return finish("optimizer_exhausted")
+        else:
+            try:
+                if move == "flags":
+                    compiler_moves.run_flag_move(
+                        workdir, output_file, profile_result, plan, opt_state,
+                        MIN_DELTA)
+                else:
+                    compiler_moves.run_retile_move(
+                        workdir, c_filename, output_file, profile_result,
+                        plan, opt_state, PPCG_WRAPPER, MIN_DELTA)
+                optimize_result = read_stage_result(workdir, "optimize")
+            except Exception as exc:
+                result["iterations"].append(iteration_data)
+                return finish("optimize_error", f"{move} move: {exc}")
         iteration_data["optimize"] = optimize_result
 
         result["iterations"].append(iteration_data)
@@ -501,6 +573,9 @@ def _export_output(output_dir: Path, name: str, workdir: Path, generate_result: 
     dest_dir = output_dir / name
     dest_dir.mkdir(parents=True, exist_ok=True)
     shutil.copy(produced, dest_dir / output_file)
+    flags_file = src_dir / compiler_moves.NVCC_FLAGS_FILE
+    if flags_file.is_file():
+        shutil.copy(flags_file, dest_dir / flags_file.name)
     shutil.copy(run_dir / "pipeline_result.json", dest_dir / "pipeline_result.json")
 
 
@@ -515,6 +590,11 @@ def main():
                         help="who produces the initial .cu: the cuda-generate agent (llm), "
                              "PPCG polyhedral codegen (ppcg), or prefilter-routed PPCG with "
                              "LLM fallthrough (auto)")
+    parser.add_argument("--optimizer", choices=("llm", "compiler", "hybrid"), default="llm",
+                        help="who takes each iteration's optimize slot: the cuda-optimize "
+                             "agent (llm), deterministic compiler moves only -- nvcc flag "
+                             "search, then PPCG re-tiling (compiler), or compiler moves "
+                             "with LLM fallback when no candidate remains (hybrid)")
     args = parser.parse_args()
 
     for src in args.source:
@@ -525,11 +605,13 @@ def main():
 
     results = []
     for src in args.source:
-        print(f"==> {src.name}: running pipeline with {args.model} (backend={args.backend}) ...", flush=True)
+        print(f"==> {src.name}: running pipeline with {args.model} "
+              f"(backend={args.backend}, optimizer={args.optimizer}) ...", flush=True)
         start = time.monotonic()
         try:
             result = run_pipeline(src, args.model, args.timeout, args.max_iterations,
-                                  output_dir=args.output_dir, backend=args.backend)
+                                  output_dir=args.output_dir, backend=args.backend,
+                                  optimizer=args.optimizer)
         except (RuntimeError, subprocess.TimeoutExpired) as exc:
             print(f"    FAILED: {exc}")
             results.append({"name": src.stem, "exit_reason": "error", "error": str(exc)})

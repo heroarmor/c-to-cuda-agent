@@ -141,11 +141,16 @@ Wiring constraints (from the existing pipeline, both deliberate):
   --backend ppcg|auto`: `prefilter.py` triage → PPCG attempt → LLM fallthrough;
   `pipeline_result.json` carries a `backend` tag. Still open: `evaluation/`
   reporting per-backend `fast_1` / geomean / codegen-cost from that tag.
-- **Phase 2.5 — Compiler moves in the optimize loop** — first the `nvcc` flag
-  search (backend-agnostic, cheapest), then PPCG re-tiling for bucket-A
-  programs (re-invoking `ppcg_to_cu.py` with new `--sizes`); orchestrator-side
-  dispatch per "Compiler backend in the *optimize* stage" above. Report tuner
-  moves vs. LLM moves separately in `evaluation/`.
+- **Phase 2.5 — Compiler moves in the optimize loop** ✅ *(pipeline side)* —
+  `run_pipeline.py --optimizer compiler|hybrid` dispatches optimize slots to
+  `agent_pipeline/compiler_moves.py`: the `nvcc` flag search first
+  (backend-agnostic, profile-guided, best-of-K inside one slot), then PPCG
+  re-tiling via `ppcg_to_cu.py --sizes`; accepted flags persist in
+  `nvcc_flags.txt` (honored by the verify/profile skills, exported with the
+  best `.cu`); `--backend ppcg --optimizer compiler` = fully deterministic,
+  zero-token pipeline. Planning is pure and tested (`test_compiler_moves.py`,
+  fake-toolchain gate tests). Still open: GPU validation, and per-move
+  reporting in `evaluation/` (each iteration carries an `optimize_move` tag).
 - **Phase 3 — Hybrid (bucket B)** — for `lu`/`qr`/`multigrid`/`lbm`/`rgf`, let
   PPCG generate the affine sub-kernel and the LLM stitch the host/irregular glue;
   optionally feed PPCG's dependence/tiling analysis to the LLM as hints.
