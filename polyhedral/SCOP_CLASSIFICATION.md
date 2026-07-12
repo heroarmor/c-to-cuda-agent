@@ -69,32 +69,38 @@ GPU port must parallelize), not its setup/verification code.
 
 **PPCG touches ~14/29 (~48%) in some capacity; owns ~9/29 (~31%) outright.**
 
-## Group-member datasets (classified in place)
+## Group-member datasets (now moved into benchmark/)
 
-The group datasets (`dataset_zyj/`, `dataset_zhr/`) are treated as part of the same
-unified benchmark set for classification, but are **left where they are** — they
-follow a deliberately different contract (comment-free source so the agent gets no
-hints, external `measure.py` + `golden/` verification instead of embedded
-checksums/timing). The tier/field below is a *logical* label, not a physical path;
-no files were moved or rewritten. `dataset_zyj/tools/llama2_gen_checkpoint.c` is a
-data generator, not a workload, and is excluded.
+The 12 group-dataset workloads were **moved into `benchmark/`** (via `git mv`,
+`taskN_` prefixes dropped, two new fields `dnn/` and `clustering/` added). They were
+**not** rewritten to benchmark's convention — they keep their comment-free source
+(zyj's deliberate "no answer key for the agent" choice) and print a checksum but no
+embedded `time=` region — so `benchmark/` is now intentionally mixed-convention.
+The old `dataset_zyj/` / `dataset_zhr/` dirs retain only orphaned harness scaffolding
+(`measure.py`, `golden/`, `METADATA.md`, `Makefile`).
 
-| Program (path) | Owner | Logical tier/field | Bucket | Why |
+| Program (new path) | Owner | Tier/field | Bucket | Why |
 |---|---|---|---|---|
-| `dataset_zyj/single_kernel/reduction.c` | zyj | easy/dense-linalg | **A** | affine sum/min/max/variance reductions |
-| `dataset_zhr/single_kernel/task1_conv2d_relu.c` | zhr | easy/dnn | **A** | dense conv, affine 6-nest + ReLU |
-| `dataset_zhr/single_kernel/task3_mlp_two_layer.c` | zhr | easy/dnn | **A** | two dense (GEMM) layers, affine |
-| `dataset_zhr/single_kernel/task2_simple_rnn.c` | zhr | moderate/dnn | **A** | per-step matvec affine; host-driven time recurrence (stencil-shaped) |
-| `dataset_zyj/multi_kernels/CNN.c` | zyj | moderate/dnn | **A** | conv→relu→pool→fc, every stage affine (argmax tail is host) |
-| `dataset_zyj/multi_kernels/image_process.c` | zyj | moderate/image | **B** | grayscale/equalize passes affine, but **histogram scatter** + **CDF scan** are not |
-| `dataset_zhr/multi_kernels/task4_multihead_attention.c` | zhr | moderate/dnn | **B** | GEMMs + (triangular) softmax reductions affine; multi-head reshape/batch is host glue |
-| `dataset_zyj/multi_kernels/tiny_cnn_training_single_file.c` | zyj | complex/dnn | **B** | affine conv/dense/backprop kernels buried in a struct-based `Tensor*` framework + sequential training loop |
-| `dataset_zhr/multi_kernels/task5_bfs_graph.c` | zhr | moderate/graph | **C-hard** | CSR/CSC PageRank; gather/scatter indirection |
-| `dataset_zhr/multi_kernels/task6_kmeans.c` | zhr | complex/clustering | **C-hard** | kNN top-k + Gram-Schmidt deps + data-dependent k-means |
-| `dataset_zyj/multi_kernels/stream_cluster.c` | zyj | complex/clustering | **C-hard** | online facility-location; data-dependent center opening |
-| `dataset_zyj/multi_kernels/llama2_c_inference.c` | zyj | complex/dnn | **C-hard** | autoregressive token loop; **not self-contained** (needs generated `model.bin`/`tokenizer.bin`) |
+| `benchmark/easy/dense-linalg/reduction.c` | zyj | easy/dense-linalg | **A** | affine sum/min/max/variance reductions |
+| `benchmark/easy/dnn/conv2d_relu.c` | zhr | easy/dnn | **A** | dense conv, affine 6-nest + ReLU |
+| `benchmark/easy/dnn/mlp_two_layer.c` | zhr | easy/dnn | **A** | two dense (GEMM) layers, affine |
+| `benchmark/moderate/dnn/simple_rnn.c` | zhr | moderate/dnn | **A** | per-step matvec affine; host-driven time recurrence (stencil-shaped) |
+| `benchmark/moderate/dnn/cnn.c` | zyj | moderate/dnn | **A** | conv→relu→pool→fc, every stage affine (argmax tail is host) |
+| `benchmark/moderate/image/image_process.c` | zyj | moderate/image | **B** | grayscale/equalize passes affine, but **histogram scatter** + **CDF scan** are not |
+| `benchmark/moderate/dnn/multihead_attention.c` | zhr | moderate/dnn | **B** | GEMMs + (triangular) softmax reductions affine; multi-head reshape/batch is host glue |
+| `benchmark/complex/dnn/cnn_training.c` | zyj | complex/dnn | **B** | affine conv/dense/backprop kernels buried in a struct-based `Tensor*` framework + sequential training loop |
+| `benchmark/moderate/graph/bfs_graph.c` | zhr | moderate/graph | **C-hard** | CSR/CSC PageRank; gather/scatter indirection |
+| `benchmark/complex/clustering/spectral_clustering.c` | zhr | complex/clustering | **C-hard** | kNN top-k + Gram-Schmidt deps + data-dependent k-means |
+| `benchmark/complex/clustering/stream_cluster.c` | zyj | complex/clustering | **C-hard** | online facility-location; data-dependent center opening |
+| `benchmark/complex/dnn/llama2_inference.c` | zyj | complex/dnn | **C-hard** | autoregressive token loop; **not self-contained** (see caveat) |
 
 Dataset totals: **A ×5, B ×3, C ×4** (12 programs).
+
+> **`llama2_inference.c` caveats.** (1) Needed `#include <stdint.h>` added to compile
+> under benchmark's `-std=c11`. (2) It is the one program that violates benchmark's
+> self-contained rule: it `mmap`s a checkpoint, so it needs `llama2_gen_checkpoint`
+> (moved alongside it) run first to produce `model.bin`/`tokenizer.bin`. It compiles
+> under `make` but does not "just run" like the rest.
 
 ## Combined coverage (benchmark + datasets)
 
@@ -108,11 +114,12 @@ Dataset totals: **A ×5, B ×3, C ×4** (12 programs).
 Adding the datasets **raises the PPCG-addressable share** (A+B) from 48% to 54% —
 the datasets skew toward dense NN kernels (conv/GEMM/MLP), exactly PPCG's strength.
 
-> Integration note: because the dataset programs print no embedded `time=` region,
-> the `evaluation/` execution-time metric (which parses that field) does not apply
-> to them as-is; their timing comes from `measure.py`'s external wall-clock. The
-> polyhedral/LLM *conversion* path is unaffected — it consumes the `.c` and diffs
-> stdout, which they do produce (checksums).
+> Integration note: the moved dataset programs print no embedded `time=` region,
+> so the `evaluation/` execution-time metric (which parses that field) does not
+> apply to them as-is — they'd need either an embedded timing line added or an
+> external wall-clock path (the orphaned `dataset_*/measure.py` did this before the
+> move). The polyhedral/LLM *conversion* path is unaffected — it consumes the `.c`
+> and diffs stdout, which they do produce (checksums).
 
 ## Verdict
 
