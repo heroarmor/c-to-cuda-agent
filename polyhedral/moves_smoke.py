@@ -77,25 +77,40 @@ def main():
 
     state = cm.new_state()
     cu_text = (workdir / f"{name}.cu").read_text(encoding="utf-8")
+    entry = json.loads((HERE / "scop_targets.json").read_text()).get(src.name)
 
-    plan = cm.plan_move("compiler", "ppcg", profile, cu_text, state)
-    assert plan.move == "flags", plan
-    print("\n== move 1: flags ==")
-    result = cm.run_flag_move(workdir, f"{name}.cu", profile, plan, state, 0.05)
-    print(json.dumps({k: result[k] for k in
-                      ("technique_applied", "accepted", "rationale")}, indent=2))
-
-    plan = cm.plan_move("compiler", "ppcg", profile, cu_text, state)
-    assert plan.move == "retile", plan
-    print("\n== move 2: retile ==")
-    result = cm.run_retile_move(workdir, src.name, f"{name}.cu", profile,
-                                plan, state, HERE / "ppcg_to_cu.py", 0.05)
-    print(json.dumps({k: result[k] for k in
-                      ("technique_applied", "accepted", "rationale")}, indent=2))
-
-    plan = cm.plan_move("compiler", "ppcg", profile, cu_text, state)
-    print(f"\nnext plan after both moves: {plan.move}")
-    print("moves_smoke: all steps completed")
+    # Walk the compiler-move dispatch exactly as the orchestrator would:
+    # library substitution (if the entry declares one), then flags, then
+    # retile, until nothing is left. Decisions are data, not pass/fail.
+    for step in range(1, 5):
+        plan = cm.plan_move("compiler", "ppcg", profile, cu_text, state,
+                            scop_entry=entry)
+        if plan.move not in ("library", "flags", "retile"):
+            print(f"\nno compiler move left after step {step - 1} "
+                  f"(plan: {plan.move})")
+            break
+        print(f"\n== move {step}: {plan.move} ==")
+        if plan.move == "library":
+            result = cm.run_library_move(
+                workdir, src.name, f"{name}.cu", profile, plan, state,
+                HERE / "cublas_to_cu.py", 0.05)
+        elif plan.move == "flags":
+            result = cm.run_flag_move(
+                workdir, f"{name}.cu", profile, plan, state, 0.05)
+        else:
+            result = cm.run_retile_move(
+                workdir, src.name, f"{name}.cu", profile, plan, state,
+                HERE / "ppcg_to_cu.py", 0.05)
+        print(json.dumps({k: result[k] for k in
+                          ("technique_applied", "accepted", "rationale")},
+                         indent=2))
+        if result["accepted"]:
+            # the accepted candidate is the new thing to beat, same way the
+            # next profile stage would re-baseline the loop
+            best = min(c["mean_sec"] for c in result["candidates"]
+                       if c["mean_sec"] is not None)
+            profile = dict(profile, time_sec=best)
+    print("\nmoves_smoke: all steps completed")
 
 
 if __name__ == "__main__":

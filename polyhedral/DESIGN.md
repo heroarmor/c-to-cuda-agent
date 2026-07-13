@@ -143,9 +143,13 @@ Wiring constraints (from the existing pipeline, both deliberate):
   reporting per-backend `fast_1` / geomean / codegen-cost from that tag.
 - **Phase 2.5 — Compiler moves in the optimize loop** ✅ *(pipeline side)* —
   `run_pipeline.py --optimizer compiler|hybrid` dispatches optimize slots to
-  `agent_pipeline/compiler_moves.py`: the `nvcc` flag search first
+  `agent_pipeline/compiler_moves.py`: cuBLAS library substitution first when
+  a `scop_targets.json` entry declares a GEMM-shaped hot function
+  (algorithmic tier, `cublas_to_cu.py`), then the `nvcc` flag search
   (backend-agnostic, profile-guided, best-of-K inside one slot), then PPCG
-  re-tiling via `ppcg_to_cu.py --sizes`; accepted flags persist in
+  re-tiling via `ppcg_to_cu.py --sizes`/schedule options; launch-overhead
+  profiles attach a directed `CUDA_Graph_Capture` hint to hybrid-mode LLM
+  moves. Accepted flags persist in
   `nvcc_flags.txt` (honored by the verify/profile skills, exported with the
   best `.cu`); `--backend ppcg --optimizer compiler` = fully deterministic,
   zero-token pipeline. Planning is pure and tested (`test_compiler_moves.py`);

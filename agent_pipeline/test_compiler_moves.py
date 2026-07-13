@@ -52,18 +52,26 @@ def test_parse_ncu_summary():
     assert m["sm_pct"] is None and m["occupancy_pct"] == 55.0, m
     assert cm.headroom_tier(m) == "unknown"
 
+    # launch-count scrape: instances and total launches, max wins
+    m = cm.parse_ncu_summary(
+        "Kernel0 (97,560 instances, 99.3% of GPU time) ... Nsight Systems: "
+        "98,149 total kernel launches across 7 kernel types")
+    assert m["launches"] == 98149, m
+    assert cm.parse_ncu_summary(SUMMARY)["launches"] is None
+
 
 def test_propose_flag_candidates():
     metrics = cm.parse_ncu_summary(SUMMARY)
     cu = "..." + " __expf(x); sqrtf(y); "
     cands = cm.propose_flag_candidates(metrics, cu, set(), [])
     keys = [k for k, _ in cands]
-    # register/occupancy signal first, then the memory stall, then fast math
+    # register/occupancy signal first, then the memory stalls, then fast math
     assert keys == ["maxrregcount=64", "maxrregcount=32", "dlcm=cg",
-                    "use_fast_math"], keys
+                    "dscm=cs", "use_fast_math"], keys
 
     # tried filtering + already-accepted-flag filtering
-    cands = cm.propose_flag_candidates(metrics, cu, {"maxrregcount=64"},
+    cands = cm.propose_flag_candidates(metrics, cu, {"maxrregcount=64",
+                                                     "dscm=cs"},
                                        ["-Xptxas", "-dlcm=cg"])
     keys = [k for k, _ in cands]
     assert keys == ["maxrregcount=32", "use_fast_math"], keys
@@ -77,7 +85,7 @@ def test_propose_flag_candidates():
     cands = cm.propose_flag_candidates(cm.parse_ncu_summary(""), "a*b+c",
                                        set(), [])
     keys = [k for k, _ in cands]
-    assert keys == ["maxrregcount=64", "dlcm=cg"], keys
+    assert keys == ["maxrregcount=64", "dlcm=cg", "ptxas-O3"], keys
 
 
 def test_propose_sizes_candidates():
@@ -110,6 +118,29 @@ def test_plan_move():
     # everything exhausted
     state["tried_sizes"] = set(cm.SIZES_LADDER)
     assert cm.plan_move("compiler", "ppcg", profile, "", state).move == "none"
+
+    # library substitution: first priority when the entry declares blas
+    # metadata and the backend is ppcg; never for other backends; once only
+    entry = {"fn": "gemm", "blas": {"fn": "gemm", "type": "float", "dim": "n"}}
+    state = cm.new_state()
+    plan = cm.plan_move("compiler", "ppcg", profile, "", state, scop_entry=entry)
+    assert plan.move == "library" and plan.blas["fn"] == "gemm", plan
+    assert cm.plan_move("compiler", "hybrid", profile, "", state,
+                        scop_entry=entry).move != "library"
+    state["tried_library"] = True
+    assert cm.plan_move("compiler", "ppcg", profile, "", state,
+                        scop_entry=entry).move == "flags"
+
+    # launch-overhead profile attaches the CUDA-Graphs hint to LLM moves only
+    launchy = {"time_sec": 1.0, "ncu_summary":
+               "98,149 total kernel launches; CPU-side launch overhead 64%"}
+    state = cm.new_state()
+    state["tried_flags"] = set(cm.FLAG_GROUPS)
+    plan = cm.plan_move("hybrid", "llm", launchy, "", state)
+    assert plan.move == "llm" and plan.hint is not None, plan
+    state = cm.new_state()
+    plan = cm.plan_move("hybrid", "llm", launchy, "", state)
+    assert plan.move == "flags" and plan.hint is None, plan
 
 
 def _write_executable(path: Path, text: str):
@@ -179,16 +210,44 @@ EOF
 chmod +x "$out"
 """
 
-# Fake ppcg_to_cu.py: records the --sizes it was given into the emitted "cu".
+# Fake ppcg_to_cu.py: records the --sizes/--ppcg-arg it was given into the
+# emitted "cu".
 FAKE_PPCG_WRAPPER = """#!/usr/bin/env python3
 import argparse
 ap = argparse.ArgumentParser()
 ap.add_argument("input")
 ap.add_argument("-o", "--output")
 ap.add_argument("--sizes")
+ap.add_argument("--ppcg-arg", action="append", default=[])
 args = ap.parse_args()
 with open(args.output, "w") as f:
-    f.write("/* fake ppcg output; sizes=%s */\\n" % args.sizes)
+    f.write("/* fake ppcg output; sizes=%s args=%s */\\n"
+            % (args.sizes, args.ppcg_arg))
+print(args.output)
+"""
+
+# Fake nvcc that always emits a fast, correct binary (for the library move).
+NVCC_ALWAYS_FAST = """#!/bin/sh
+out=""
+while [ $# -gt 0 ]; do
+  case "$1" in -o) out=$2; shift ;; esac
+  shift
+done
+printf '#!/bin/sh\\nsleep 0.01\\necho "result 42"\\n' > "$out"
+chmod +x "$out"
+"""
+
+# Fake cublas_to_cu.py: emits a marker "cu" so the move has a candidate.
+FAKE_CUBLAS_WRAPPER = """#!/usr/bin/env python3
+import argparse
+ap = argparse.ArgumentParser()
+ap.add_argument("input")
+ap.add_argument("-o", "--output")
+ap.add_argument("--fn"); ap.add_argument("--type"); ap.add_argument("--dim")
+ap.add_argument("--A"); ap.add_argument("--B"); ap.add_argument("--C")
+args = ap.parse_args()
+with open(args.output, "w") as f:
+    f.write("/* fake cublas substitution of %s */\\n" % args.fn)
 print(args.output)
 """
 
@@ -283,6 +342,34 @@ def test_run_retile_move_accepts_and_rewrites_cu():
         assert "tile[64,64]" in result["technique_applied"], result
         assert "tile[64,64]" in (workdir / "prog.cu").read_text()
         assert "big-tile" in state["tried_sizes"]
+
+
+def test_run_library_move_accepts_and_links_cublas():
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        env = _fake_toolchain(tmp, NVCC_ALWAYS_FAST)
+        workdir = _workdir(tmp)
+        (workdir / "gemm.c").write_text("int main(){}\n", encoding="utf-8")
+        wrapper = tmp / "fake_cublas_to_cu.py"
+        wrapper.write_text(FAKE_CUBLAS_WRAPPER, encoding="utf-8")
+        profile = {"time_sec": 0.5, "ncu_summary": ""}
+        entry = {"blas": {"fn": "gemm", "type": "float", "dim": "n"}}
+        state = cm.new_state()
+        plan = cm.plan_move("compiler", "ppcg", profile, "", state,
+                            scop_entry=entry)
+        assert plan.move == "library", plan
+        result = _with_path(env, lambda: cm.run_library_move(
+            workdir, "gemm.c", "prog.cu", profile, plan, state, wrapper, 0.05))
+        schemas.validate("optimize", result)
+        assert result["accepted"] is True, result
+        assert result["technique_applied"] == "CuBLAS_Substitution(gemm)", result
+        assert "-lcublas" in state["flags"], state
+        assert "-lcublas" in (workdir / cm.NVCC_FLAGS_FILE).read_text()
+        assert "fake cublas substitution" in (workdir / "prog.cu").read_text()
+        assert state["tried_library"] is True
+        # once tried, plan_move moves on even though blas metadata remains
+        assert cm.plan_move("compiler", "ppcg", profile, "", state,
+                            scop_entry=entry).move == "flags"
 
 
 def test_run_retile_move_losing_candidate_keeps_cu():

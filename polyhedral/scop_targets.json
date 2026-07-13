@@ -1,7 +1,8 @@
 {
   "_comment": "Hot-function map for the PPCG backend, keyed by source basename. fn: function(s) whose bodies get #pragma scop markers (Phase 0's per-program hot-kernel calls, SCOP_CLASSIFICATION.md). arrays: flat-pointer params ppcg_to_cu.py delinearizes into 2D VLA form (param -> row stride) -- pet cannot handle p[i*n+j] on a flat T* (bilinear subscript, undecidable extent; it silently emits zero kernels or hard-fails), but handles the equivalent (*p)[n] 2D form. Entries without a mode are bucket-A: PPCG output is the whole translation. mode=hybrid marks bucket-B Phase 3 targets: only the listed affine sub-kernels are GPU-ified and run_pipeline.py routes through the hybrid relay (PPCG partial + LLM glue-stitching). Either way the wrapper now fails loudly when no kernel comes out, so a bad entry falls through to the LLM path instead of shipping host-only code with a ppcg tag.",
   "saxpy.c": {"fn": "saxpy"},
-  "gemm.c": {"fn": "gemm", "arrays": {"A": "n", "B": "n", "C": "n"}},
+  "gemm.c": {"fn": "gemm", "arrays": {"A": "n", "B": "n", "C": "n"},
+             "blas": {"fn": "gemm", "type": "float", "dim": "n"}},
   "heat2d.c": {"fn": "step",
                "_why": "currently falls through: step() computes a derived flat index (int i = y*m+x; u[i-1], u[i-m]) that textual delinearization can't rewrite -- needs region-level source normalization, same club as lu/qr/lbm"},
   "multigrid.c": {"fn": "smooth_rb,prolong_add", "mode": "hybrid",

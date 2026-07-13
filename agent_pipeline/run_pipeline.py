@@ -117,6 +117,7 @@ WORKDIR_TOOLS = [COMPARE_SCRIPT, TIME_BINARY_SCRIPT, NCU_CONFIG_FILE]
 # routing metadata (which entries are mode=hybrid, and which functions to name
 # in the hybrid generate prompt) -- never to decide what is affine.
 PPCG_WRAPPER = ROOT_DIR / "polyhedral" / "ppcg_to_cu.py"
+CUBLAS_WRAPPER = ROOT_DIR / "polyhedral" / "cublas_to_cu.py"
 PREFILTER = ROOT_DIR / "polyhedral" / "prefilter.py"
 SCOP_TARGETS = ROOT_DIR / "polyhedral" / "scop_targets.json"
 
@@ -199,6 +200,14 @@ def run_stage(stage: str, prompt: str, workdir: Path, model: str, timeout_sec: f
 
     env = os.environ.copy()
     env["OPENCODE_CONFIG_DIR"] = str(OPENCODE_CONFIG_DIR)
+    # Isolate opencode's mutable state (its sqlite session store lives under
+    # XDG_DATA_HOME) per pipeline run, inside the run's own /tmp workdir.
+    # Without this, concurrent pipeline runs -- e.g. several Slurm jobs on
+    # different nodes -- share ~/.local/share/opencode over the network
+    # filesystem and corrupt the store ("file is not a database", observed
+    # 2026-07-12 when three jobs ran at once). The store still persists
+    # across the 4 stage calls of one run, which is all --session needs.
+    env["XDG_DATA_HOME"] = str(workdir / ".opencode_data")
 
     # stdin=DEVNULL is required, not optional: opencode's `run` command does
     # `process.stdin.isTTY ? undefined : await Bun.stdin.text()` to pick up
@@ -435,8 +444,12 @@ def run_pipeline(
 
     # Set by the hybrid routing below before the generate stage ever runs;
     # read late-bound inside call() so the generate prompt can point the agent
-    # at PPCG's partial artifact when the hybrid relay produced one.
+    # at PPCG's partial artifact when the hybrid relay produced one. The
+    # optimize hint works the same way, but per-iteration: plan_move attaches
+    # a directed instruction (e.g. CUDA Graph capture on a launch-overhead
+    # profile) that rides along on that iteration's optimize prompt only.
     hybrid_info = None
+    optimize_hint = {"text": None}
 
     def call(stage: str, session_id: str | None, iteration: int | None = None) -> str | None:
         # iteration suffix keeps each loop pass's log distinct -- verify/profile/
@@ -444,6 +457,8 @@ def run_pipeline(
         # after the first would silently overwrite the previous one's log.
         log_name = f"{stage}.log" if iteration is None else f"{stage}_iter{iteration}.log"
         prompt = stage_prompt(stage, c_filename, hybrid_info if stage == "generate" else None)
+        if stage == "optimize" and optimize_hint["text"]:
+            prompt += " " + optimize_hint["text"]
         proc, new_session_id = run_stage(stage, prompt, workdir, model, timeout_sec, session_id)
         (run_dir / log_name).write_text(
             f"$ {' '.join(['bun', 'dev', 'run', prompt, '--agent', STAGE_AGENT[stage]])}\n\n"
@@ -467,6 +482,7 @@ def run_pipeline(
         except (RuntimeError, subprocess.TimeoutExpired, ValueError) as exc:
             return session_id, None, f"{stage}: {exc}"
 
+    started = time.monotonic()
     result = {"name": name, "source": str(source), "workdir": str(workdir),
               "optimizer": optimizer, "iterations": []}
     # Cross-iteration compiler-tuner state: candidates already tried (accepted
@@ -480,6 +496,9 @@ def run_pipeline(
         # seen so far is always exported, no matter which stage stopped the
         # pipeline -- partial progress is still useful, not all-or-nothing.
         result["exit_reason"] = exit_reason
+        # total conversion wall-clock: the codegen-cost metric
+        # (evaluation/scripts/backend_report.py) reads it per backend
+        result["elapsed_sec"] = round(time.monotonic() - started, 1)
         if error is not None:
             result["error"] = error
         _write_summary(run_dir, result)
@@ -601,12 +620,15 @@ def run_pipeline(
             cu_text = cu_path.read_text(encoding="utf-8") if cu_path.is_file() else ""
             plan = compiler_moves.plan_move(
                 optimizer, result["backend"], profile_result, cu_text,
-                opt_state, retile_available=PPCG_WRAPPER.is_file())
+                opt_state, retile_available=PPCG_WRAPPER.is_file(),
+                scop_entry=entry)
         move = plan.move if plan is not None else "llm"
         iteration_data["optimize_move"] = move
 
         if move == "llm":
+            optimize_hint["text"] = plan.hint if plan is not None else None
             session_id, optimize_result, error = call_and_read("optimize", session_id, i)
+            optimize_hint["text"] = None
             if error is not None:
                 result["iterations"].append(iteration_data)
                 return finish("optimize_error", error)
@@ -626,6 +648,10 @@ def run_pipeline(
                     compiler_moves.run_flag_move(
                         workdir, output_file, profile_result, plan, opt_state,
                         MIN_DELTA)
+                elif move == "library":
+                    compiler_moves.run_library_move(
+                        workdir, c_filename, output_file, profile_result,
+                        plan, opt_state, CUBLAS_WRAPPER, MIN_DELTA)
                 else:
                     compiler_moves.run_retile_move(
                         workdir, c_filename, output_file, profile_result,

@@ -79,17 +79,49 @@ FLAG_GROUPS = {
         "bottleneck": "compute_throughput_transcendentals",
         "expect": ["sm_throughput_pct up", "kernel duration down"],
     },
+    "dscm=cs": {
+        "flags": ("-Xptxas", "-dscm=cs"),
+        "bottleneck": "global_memory_store_streaming",
+        "expect": ["less L2 pollution from streaming stores"],
+    },
+    "ptxas-O3": {
+        "flags": ("-Xptxas", "-O3", "-Xptxas",
+                  "--allow-expensive-optimizations=true"),
+        "bottleneck": "instruction_pipeline_generic",
+        "expect": ["issued IPC up"],
+    },
 }
 
-# Generic --sizes ladders for PPCG re-tiling: {kernel[i]->...} applies to every
-# kernel PPCG emits. Shapes a kernel can't take (e.g. 2D block on a 1D nest)
-# just make that candidate fail PPCG or the diff and get skipped mechanically.
+# Retile candidates for the PPCG re-tiling move: each entry is a --sizes
+# string, extra raw ppcg arguments, or both (option names verified against
+# ppcg --help of the pinned toolchain, PPCG 0.09.3). {kernel[i]->...} applies
+# to every kernel PPCG emits; shapes a kernel can't take (e.g. 2D block on a
+# 1D nest) just make that candidate fail PPCG or the diff and get skipped
+# mechanically.
 SIZES_LADDER = {
-    "small-block": "{kernel[i]->tile[16,16];kernel[i]->block[16,8]}",
-    "default-256": "{kernel[i]->tile[32,32];kernel[i]->block[32,8]}",
-    "big-tile": "{kernel[i]->tile[64,64];kernel[i]->block[16,16]}",
-    "wide-x": "{kernel[i]->tile[64,16];kernel[i]->block[64,4]}",
+    "small-block": {"sizes": "{kernel[i]->tile[16,16];kernel[i]->block[16,8]}"},
+    "default-256": {"sizes": "{kernel[i]->tile[32,32];kernel[i]->block[32,8]}"},
+    "big-tile": {"sizes": "{kernel[i]->tile[64,64];kernel[i]->block[16,16]}"},
+    "wide-x": {"sizes": "{kernel[i]->tile[64,16];kernel[i]->block[64,4]}"},
+    "tile-64": {"args": ["--tile-size=64"]},
+    "no-shared": {"args": ["--no-shared-memory"]},
+    "unroll-tile": {"args": ["--unroll-gpu-tile"]},
 }
+
+# A launch count at or above this (parsed from ncu_summary) marks the run as
+# launch-overhead-shaped: the fix (wrap the launch loop in CUDA Graph capture)
+# is a structural host-code rewrite no compiler flag can perform, so plan_move
+# attaches a directed hint to the LLM optimize move instead (see plan_move).
+LAUNCH_OVERHEAD_THRESHOLD = 1000
+
+CUDA_GRAPHS_HINT = (
+    "The profile shows a very large number of kernel launches with CPU-side "
+    "launch overhead dominating wall-clock time. Strongly consider the "
+    "CUDA_Graph_Capture technique from the cuda-bottleneck-playbook: capture "
+    "the repetitive launch sequence into a CUDA Graph once "
+    "(cudaStreamBeginCapture / cudaStreamEndCapture / cudaGraphInstantiate) "
+    "and replay it with cudaGraphLaunch, keeping allocations and one-time "
+    "setup outside the captured region.")
 
 # Benchmarks print their own wall-clock (e.g. "time=0.123 s", gemm adds
 # "(12.34 GFLOP/s)"), which legitimately differs between the C baseline and
@@ -122,6 +154,8 @@ def parse_ncu_summary(text: str | None) -> dict:
 
     regs = pct(r"(\d+)\s*(?:regs?|registers?)\s*(?:/|per)\s*thread",
                r"(?:regs?|registers?)\s*(?:/|per)\s*thread\D{0,10}?(\d+)")
+    launch_counts = [int(m.replace(",", "")) for m in re.findall(
+        r"([\d,]+)\s*(?:total\s+)?(?:kernel\s+)?(?:launches|instances)", low)]
     return {
         "sm_pct": pct(r"\bsm\b\D{0,30}?([\d.]+)\s*%"),
         "dram_pct": pct(r"\bdram\b\D{0,30}?([\d.]+)\s*%"),
@@ -129,6 +163,7 @@ def parse_ncu_summary(text: str | None) -> dict:
                              r"([\d.]+)\s*%\s*(?:achieved\s+)?occupanc"),
         "regs_per_thread": int(regs) if regs is not None else None,
         "stall": next((k for k in _STALL_KEYWORDS if k in low), None),
+        "launches": max(launch_counts) if launch_counts else None,
     }
 
 
@@ -162,7 +197,7 @@ def propose_flag_candidates(metrics: dict, cu_text: str,
             (occupancy is not None and occupancy < 50):
         order += ["maxrregcount=64", "maxrregcount=32"]
     if metrics.get("stall") in _MEMORY_STALLS:
-        order += ["dlcm=cg"]
+        order += ["dlcm=cg", "dscm=cs"]
     if uses_transcendentals:
         order += ["use_fast_math"]
     if not order and all(metrics.get(k) is None for k in
@@ -171,7 +206,7 @@ def propose_flag_candidates(metrics: dict, cu_text: str,
         # No ncu signal at all (ncu_available false / unparseable summary):
         # fall back to the generic ladder rather than doing nothing.
         order = (["use_fast_math"] if uses_transcendentals else []) \
-            + ["maxrregcount=64", "dlcm=cg"]
+            + ["maxrregcount=64", "dlcm=cg", "ptxas-O3"]
 
     seen, candidates = set(), []
     for key in order:
@@ -186,61 +221,87 @@ def propose_flag_candidates(metrics: dict, cu_text: str,
 
 
 def propose_sizes_candidates(metrics: dict, tried: set) -> list:
-    """Ordered [(key, sizes)] of untried PPCG --sizes candidates: smaller
-    blocks first when occupancy is the complaint, bigger tiles first when the
-    signal is memory-shaped, a neutral order otherwise."""
+    """Ordered [(key, spec)] of untried PPCG retile candidates (spec carries a
+    --sizes string, extra ppcg args, or both): smaller blocks first when
+    occupancy is the complaint, bigger tiles first when the signal is
+    memory-shaped, a neutral order otherwise; the option-flag candidates
+    (uniform tile, no shared memory, tile unrolling) trail as diversity."""
     occupancy = metrics.get("occupancy_pct")
     dram = metrics.get("dram_pct")
     memory_bound = (metrics.get("stall") in _MEMORY_STALLS) or \
         (dram is not None and dram > 60)
     if occupancy is not None and occupancy < 50:
-        order = ["small-block", "default-256", "wide-x", "big-tile"]
+        order = ["small-block", "default-256", "wide-x", "big-tile",
+                 "no-shared", "unroll-tile"]
     elif memory_bound:
-        order = ["big-tile", "wide-x", "default-256", "small-block"]
+        order = ["big-tile", "tile-64", "wide-x", "default-256",
+                 "small-block", "unroll-tile"]
     else:
-        order = ["default-256", "big-tile", "wide-x", "small-block"]
-    return [(key, SIZES_LADDER[key]) for key in order if key not in tried]
+        order = ["default-256", "big-tile", "wide-x", "small-block",
+                 "tile-64", "no-shared", "unroll-tile"]
+    seen = set()
+    return [(key, SIZES_LADDER[key]) for key in order
+            if key not in tried and not (key in seen or seen.add(key))]
 
 
 @dataclass
 class MovePlan:
-    move: str  # "flags" | "retile" | "llm" | "none"
+    move: str  # "library" | "flags" | "retile" | "llm" | "none"
     metrics: dict = field(default_factory=dict)
     tier: str = "unknown"
     flag_candidates: list = field(default_factory=list)
     sizes_candidates: list = field(default_factory=list)
+    blas: dict | None = None   # scop_targets "blas" metadata for the library move
+    hint: str | None = None    # directed instruction appended to an LLM move's prompt
 
 
 def new_state() -> dict:
     """Per-run optimizer state the orchestrator threads through iterations:
     which candidates were already tried (accepted or not), and the currently
     accepted nvcc flag set (what nvcc_flags.txt holds)."""
-    return {"tried_flags": set(), "tried_sizes": set(), "flags": []}
+    return {"tried_flags": set(), "tried_sizes": set(), "tried_library": False,
+            "flags": []}
 
 
 def plan_move(mode: str, backend: str, profile_result: dict, cu_text: str,
-              state: dict, retile_available: bool = True) -> MovePlan:
+              state: dict, retile_available: bool = True,
+              scop_entry: dict | None = None) -> MovePlan:
     """Decide this iteration's optimize move. Pure -- no toolchain, no I/O.
 
-    Priority per DESIGN.md Phase 2.5: the nvcc flag search first (cheapest,
-    backend-agnostic), then PPCG re-tiling (ppcg-produced .cu only), then the
-    LLM agent (hybrid) or a stop signal (compiler-only)."""
+    Priority: library substitution first when the program's scop_targets
+    entry declares a BLAS-shaped hot function (algorithmic tier -- the
+    playbook's own priority order puts algorithm changes above hardware
+    tuning), then the nvcc flag search (cheapest, backend-agnostic), then
+    PPCG re-tiling (ppcg-produced .cu only -- a hybrid/llm .cu would lose
+    its LLM work to a regeneration), then the LLM agent (hybrid mode) or a
+    stop signal (compiler-only). When the parsed profile is launch-overhead
+    shaped, an LLM move carries a directed CUDA-Graphs hint -- that fix is a
+    structural host rewrite no compiler knob can make."""
     metrics = parse_ncu_summary(profile_result.get("ncu_summary"))
     plan = MovePlan(move="llm", metrics=metrics, tier=headroom_tier(metrics))
+    launch_shaped = (metrics.get("launches") or 0) >= LAUNCH_OVERHEAD_THRESHOLD \
+        or "launch overhead" in (profile_result.get("ncu_summary") or "").lower()
     if mode == "llm":
         return plan
+    blas = (scop_entry or {}).get("blas")
     plan.flag_candidates = propose_flag_candidates(
         metrics, cu_text, state["tried_flags"], state["flags"]
     )[:MAX_FLAG_CANDIDATES]
     if backend == "ppcg" and retile_available:
         plan.sizes_candidates = propose_sizes_candidates(
             metrics, state["tried_sizes"])[:MAX_SIZES_CANDIDATES]
-    if plan.flag_candidates:
+    if blas and backend == "ppcg" and not state["tried_library"]:
+        # ppcg-only for the same reason as retile: the substitution
+        # regenerates from the original C source.
+        plan.move, plan.blas = "library", blas
+    elif plan.flag_candidates:
         plan.move = "flags"
     elif plan.sizes_candidates:
         plan.move = "retile"
     else:
         plan.move = "llm" if mode == "hybrid" else "none"
+    if plan.move == "llm" and launch_shaped:
+        plan.hint = CUDA_GRAPHS_HINT
     return plan
 
 
@@ -400,6 +461,71 @@ def run_flag_move(workdir: Path, output_file: str, profile_result: dict,
          "nvcc_flags": state["flags"]})
 
 
+def run_library_move(workdir: Path, c_filename: str, output_file: str,
+                     profile_result: dict, plan: MovePlan, state: dict,
+                     blas_wrapper: Path, min_delta: float) -> dict:
+    """Library-substitution move: regenerate the .cu from the original C
+    source with the BLAS-shaped hot function replaced by a cuBLAS call
+    (polyhedral/cublas_to_cu.py, driven by the entry's blas metadata), behind
+    the same mechanical accept/reject gate as every other move. Algorithmic
+    tier: when it applies, it usually dwarfs flag/tiling wins -- but the gate
+    still decides (at small sizes the cuBLAS handle + copies can lose).
+    On acceptance -lcublas joins the persisted nvcc flag set so the verify/
+    profile skills' rebuilds keep linking."""
+    reference = profile_result["time_sec"]
+    state["tried_library"] = True
+    arch = _detect_arch_flag()
+    blas = plan.blas or {}
+    candidate_cu = f"{Path(output_file).stem}_cublas.cu"
+    technique = "CuBLAS_Substitution(no_candidate_accepted)"
+    accepted, attempts = False, []
+    cmd = [sys.executable, str(blas_wrapper), c_filename, "-o", candidate_cu,
+           "--fn", blas.get("fn", ""), "--type", blas.get("type", "float"),
+           "--dim", blas.get("dim", "n")]
+    for param in ("A", "B", "C"):
+        if blas.get(param):
+            cmd += [f"--{param}", blas[param]]
+    try:
+        proc = subprocess.run(cmd, cwd=workdir, capture_output=True,
+                              text=True, encoding="utf-8",
+                              timeout=COMPILE_TIMEOUT_SEC)
+    except subprocess.TimeoutExpired:
+        proc = None
+    if proc is None or proc.returncode != 0 \
+            or not (workdir / candidate_cu).is_file():
+        why = "cublas_to_cu timed out" if proc is None else \
+            "cublas_to_cu failed: " + _last_line(proc.stderr or proc.stdout)
+        attempts.append({"candidate": "cublas", "mean_sec": None,
+                         "rejected": why})
+    else:
+        link_flags = state["flags"] + ["-lcublas"] + ([arch] if arch else [])
+        mean, rejected = _measure_candidate(
+            workdir, candidate_cu, link_flags, "cublas")
+        attempts.append({"candidate": "cublas", "mean_sec": mean,
+                         "rejected": rejected})
+        accepted = mean is not None and mean < reference * (1 - min_delta)
+        if accepted:
+            shutil.copy(workdir / candidate_cu, workdir / output_file)
+            if "-lcublas" not in state["flags"]:
+                state["flags"] = state["flags"] + ["-lcublas"]
+            (workdir / NVCC_FLAGS_FILE).write_text(
+                " ".join(state["flags"]) + "\n", encoding="utf-8")
+            technique = f"CuBLAS_Substitution({blas.get('fn')})"
+    rationale = (
+        f"mechanical cuBLAS substitution of {blas.get('fn')} (regenerated "
+        f"from {c_filename}) against this iteration's profiled "
+        f"{reference:.4f}s (acceptance margin {min_delta:.0%}): "
+        f"{_describe(attempts)}")
+    return _write_result(
+        workdir, technique,
+        "algorithmic_library_substitution" if accepted else "none_accepted",
+        plan.tier, rationale,
+        ["kernel duration down (vendor-tuned GEMM)"] if accepted else [],
+        "library",
+        {"accepted": accepted, "candidates": attempts,
+         "nvcc_flags": state["flags"]})
+
+
 def run_retile_move(workdir: Path, c_filename: str, output_file: str,
                     profile_result: dict, plan: MovePlan, state: dict,
                     ppcg_wrapper: Path, min_delta: float) -> dict:
@@ -410,38 +536,42 @@ def run_retile_move(workdir: Path, c_filename: str, output_file: str,
     arch = _detect_arch_flag()
     flags = state["flags"] + ([arch] if arch else [])
     attempts, best = [], None
-    for n, (key, sizes) in enumerate(plan.sizes_candidates):
+    for n, (key, spec) in enumerate(plan.sizes_candidates):
         state["tried_sizes"].add(key)
         candidate_cu = f"{Path(output_file).stem}_retile{n}.cu"
+        cmd = [sys.executable, str(ppcg_wrapper), c_filename, "-o", candidate_cu]
+        if spec.get("sizes"):
+            cmd += ["--sizes", spec["sizes"]]
+        for arg in spec.get("args", []):
+            cmd += ["--ppcg-arg", arg]
+        described = spec.get("sizes") or " ".join(spec.get("args", []))
         try:
             proc = subprocess.run(
-                [sys.executable, str(ppcg_wrapper), c_filename,
-                 "-o", candidate_cu, "--sizes", sizes],
-                cwd=workdir, capture_output=True, text=True, encoding="utf-8",
-                timeout=COMPILE_TIMEOUT_SEC)
+                cmd, cwd=workdir, capture_output=True, text=True,
+                encoding="utf-8", timeout=COMPILE_TIMEOUT_SEC)
         except subprocess.TimeoutExpired:
-            attempts.append({"candidate": key, "sizes": sizes,
+            attempts.append({"candidate": key, "spec": described,
                              "mean_sec": None, "rejected": "ppcg timed out"})
             continue
         if proc.returncode != 0 or not (workdir / candidate_cu).is_file():
             attempts.append({
-                "candidate": key, "sizes": sizes, "mean_sec": None,
+                "candidate": key, "spec": described, "mean_sec": None,
                 "rejected": "ppcg failed: "
                             + _last_line(proc.stderr or proc.stdout)})
             continue
         mean, rejected = _measure_candidate(
             workdir, candidate_cu, flags, f"retile{n}")
-        attempts.append({"candidate": key, "sizes": sizes, "mean_sec": mean,
+        attempts.append({"candidate": key, "spec": described, "mean_sec": mean,
                          "rejected": rejected})
         if mean is not None and (best is None or mean < best["mean_sec"]):
-            best = {"key": key, "sizes": sizes, "cu": candidate_cu,
+            best = {"key": key, "spec": described, "cu": candidate_cu,
                     "mean_sec": mean}
 
     accepted = best is not None and \
         best["mean_sec"] < reference * (1 - min_delta)
     if accepted:
         shutil.copy(workdir / best["cu"], workdir / output_file)
-        technique = f"PPCG_Retile({best['sizes']})"
+        technique = f"PPCG_Retile({best['spec']})"
     else:
         technique = "PPCG_Retile(no_candidate_accepted)"
     rationale = (

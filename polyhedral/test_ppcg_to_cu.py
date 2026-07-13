@@ -70,6 +70,18 @@ def test_find_function_with_vla_params():
     assert delin[ob] == "{" and delin[cb] == "}", (ob, cb)
 
 
+def test_cublas_substitution():
+    import cublas_to_cu as cb
+    out = cb.substitute(GEMM, "gemm", "float", "n", "A", "B", "C")
+    # signature intact, body replaced by the swapped-operand Sgemm call
+    assert "static void gemm(int n, const float *A" in out, out
+    assert "cublasSgemm" in out and "dev_b, n, dev_a, n" in out, out
+    assert "acc += A[i * n + k]" not in out, out
+    out_d = cb.substitute(GEMM.replace("float", "double"), "gemm",
+                          "double", "n", "A", "B", "C")
+    assert "cublasDgemm" in out_d, out_d
+
+
 def main():
     tests = [(name, fn) for name, fn in sorted(globals().items())
              if name.startswith("test_") and callable(fn)]

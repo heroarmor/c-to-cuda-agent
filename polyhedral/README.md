@@ -11,7 +11,8 @@ directory now contains the working implementation:
 | `ppcg_to_cu.py` | The backend's generate stage: runs PPCG on one benchmark C file and merges its 3-file output into **one self-contained `.cu`** (host I/O + result line intact), plus a C→C++ compatibility shim so nvcc accepts it. |
 | `scop_targets.json` | Hot-function map (basename → `--fn`) from Phase 0, consulted automatically; unmapped files fall back to pet autodetect. |
 | `verify_gpu.sbatch` | Short Slurm job (gpu-rtx6000): compile + run generated `.cu` vs the C reference, tolerance-aware golden diff with timing fields stripped. |
-| `moves_smoke.py` | GPU smoke test for the Phase 2.5 compiler optimize moves against the real toolchain (nvcc flag search + PPCG re-tiling, no opencode needed); submit with the `sbatch --wrap` line in its docstring. |
+| `cublas_to_cu.py` | The library optimize move's generator: replaces a square row-major GEMM hot function (declared by a `blas` entry in `scop_targets.json`) with a `cublasSgemm`/`cublasDgemm` call; output links with `-lcublas`. |
+| `moves_smoke.py` | GPU smoke test for the Phase 2.5 compiler optimize moves against the real toolchain (cuBLAS substitution + nvcc flag search + PPCG re-tiling, no opencode needed); submit with the `sbatch --wrap` line in its docstring. |
 
 ## Quick start
 

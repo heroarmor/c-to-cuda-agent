@@ -29,7 +29,7 @@ If `profile_result.json`'s `ncu_available` is `false`, headroom is `"unknown"` -
 
 **Parallelism / scheduling**
 - Low SM utilization -> `Increase_ILP_WorkPerThread`, `Launch_Tuning`
-- Kernel launch overhead dominating (many small kernels) -> `KernelFusion`, `MultiKernelScheduling`
+- Kernel launch overhead dominating (many small kernels) -> `KernelFusion`, `CUDA_Graph_Capture`, `MultiKernelScheduling`
 - Register pressure or spilling -> `Reduce_Live_Ranges`, `Reduce_Unrolling`, `KernelFission`
 - Instruction-issue / pipeline latency -> `Increase_ILP_WorkPerThread`, `Reduce_Instruction_Count`
 
@@ -85,9 +85,7 @@ Each entry: when it applies, what should move (and which direction) afterward, a
 
 **SharedMemory_Tradeoff_if_Beneficial** -- Trade shared memory for registers (or vice versa) when register- or shared-memory-limited occupancy is the confirmed issue. Applies when that occupancy limiter is confirmed and the shared-memory budget stays respected. Expect: occupancy up (sometimes), long-scoreboard stalls down (sometimes). Don't: oversize shared memory into a new occupancy collapse, or introduce bank conflicts without mitigating them.
 
-## A technique deliberately not catalogued here
-
-**CUDA Graphs** (`cudaGraph_t` / stream capture) amortize kernel-launch overhead across *repeated* invocations of the same kernel sequence. Most benchmarks in this dataset are single-shot programs (run once), so this doesn't apply yet -- but it's relevant if a future translation has an outer iteration loop (e.g. `CNN.c`'s `iterations` argument) and launch overhead, not compute, turns out to dominate.
+**CUDA_Graph_Capture** -- Capture a repetitive kernel-launch sequence into a CUDA Graph once (`cudaStreamBeginCapture` / `cudaStreamEndCapture` / `cudaGraphInstantiate`) and replay it with `cudaGraphLaunch`, amortizing per-launch CPU overhead. Applies when the profile shows a very large launch count with CPU-side launch overhead a major share of wall time -- which happens *inside* single-shot programs too, whenever host loops (time steps, sweeps, per-diagonal wavefronts, V-cycle levels) each launch small kernels: a multigrid translation here measured ~98k launches with ~64% of wall time spent launching. The captured region's launch parameters must be iteration-invariant -- keep allocations, host-dependent decisions, and one-time setup outside the capture; if grid shapes change per level/step, capture one graph per distinct shape (or per level) and replay those. Expect: wall-clock down while per-kernel GPU time is unchanged; the gap between total GPU time and wall time closes. Don't: capture `cudaMalloc`/`cudaFree` or host-side branching inside the region, or force a graph when each launch's configuration is genuinely data-dependent.
 
 ## Discipline
 

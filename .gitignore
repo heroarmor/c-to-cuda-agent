@@ -66,3 +66,7 @@ polyhedral/moves-smoke.log
 # github.com/sst/opencode next to the repo -- see agent_pipeline/ARCHITECTURE.md)
 /opencode/
 polyhedral/phase3-e2e.log
+polyhedral/moves-smoke2.log
+polyhedral/mg-rerun.log
+polyhedral/rgf-e2e.log
+polyhedral/easy-sweep.log
