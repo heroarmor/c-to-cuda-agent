@@ -70,3 +70,6 @@ polyhedral/moves-smoke2.log
 polyhedral/mg-rerun.log
 polyhedral/rgf-e2e.log
 polyhedral/easy-sweep.log
+polyhedral/e2e-retry.log
+polyhedral/sweep-retry.log
+polyhedral/scale-pass.log
