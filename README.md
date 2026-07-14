@@ -91,9 +91,19 @@ Everything below has been exercised on real hardware (RTX PRO 6000, CUDA 12.8):
   a free model: PPCG partial → LLM stitch, 5 iterations, every verify PASS,
   compiler and LLM moves alternating (2 flags accepted, `KernelFusion` the
   big win), 0.436s → 0.272s, best iteration exported with its flags.
-- **Honest limits** — at small problem sizes the CUDA driver-init floor
-  (~80 ms) can exceed the whole C runtime; the evaluation reports this rather
-  than hiding it. `heat2d`/`lu`/`qr`/`lbm` await region-level SCoP markers.
+- **Per-backend evaluation over the easy tier + bucket-B** — 12/14 pipeline
+  runs converted cleanly (`--backend auto --optimizer hybrid`, free model);
+  auto-routing sent `saxpy`/`gemm`/`conv2d_relu`/`nbody`/`lorenz_ensemble` to
+  the ppcg backend (mean codegen 686 s vs the LLM path's 1247 s). At large
+  problem sizes (`evaluation/scripts/scale_exports.py`) the exported
+  conversions reach **135× (gemm n=2048)**, 20× (lorenz), 12× (mandelbrot),
+  8× (reduction), 5× (heat2d).
+- **Honest limits** — at the suite's small default sizes the CUDA driver-init
+  floor (~80 ms) exceeds many whole C runtimes, so default-size speedups
+  mostly read <1×; the evaluation reports this rather than hiding it.
+  `nbody`'s conversion mismatches at 4× its default size (under
+  investigation); `saxpy`-class streaming stays copy-bound at any size;
+  `heat2d`/`lu`/`qr`/`lbm` await region-level SCoP markers.
 
 ## Documentation map
 

@@ -73,3 +73,4 @@ polyhedral/easy-sweep.log
 polyhedral/e2e-retry.log
 polyhedral/sweep-retry.log
 polyhedral/scale-pass.log
+polyhedral/scale-pass2.log

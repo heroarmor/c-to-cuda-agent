@@ -83,7 +83,12 @@ def time_mean(work, binary, args):
 
 def run_one(name, export_dir, arch):
     pj = json.loads((export_dir / "pipeline_result.json").read_text())
+    # pipeline_result records the source as given on the command line, which
+    # is usually repo-relative -- resolve it, since compiles below run from a
+    # scratch cwd
     src = Path(pj["source"])
+    if not src.is_absolute():
+        src = (REPO / src).resolve()
     args = LARGE_ARGS.get(name)
     if not args:
         return {"name": name, "skip": "no large-args entry"}
