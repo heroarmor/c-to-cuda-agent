@@ -23,8 +23,8 @@ mechanically-captured reference instead.
 This is the agent's pipeline itself, not a dataset-running script: it
 takes a sequential C source file and produces a CUDA translation plus a
 JSON trail of what each stage decided -- it has no notion of "benchmarks"
-or any other dataset-specific concept. See dataset_eval/run_dataset.py for
-the script that drives this over every benchmark in dataset_zyj/.
+or any other dataset-specific concept. See evaluation/run_dataset.py for
+the script that drives this over every benchmark in benchmark/.
 
 Each of the 4 stages is a separate opencode agent (defined under
 opencode_config/agent/) with its own system prompt and tool permissions
@@ -424,9 +424,9 @@ def run_pipeline(
     extra_files, if given, are copied into the workdir alongside the source
     (keeping their own filenames) before anything runs. This stays generic --
     run_pipeline.py itself has no notion of what these files are for -- but
-    lets a caller like dataset_eval/run_dataset.py supply runtime data a
+    lets a caller like evaluation/run_dataset.py supply runtime data a
     particular source file's zero-arg default depends on (e.g.
-    llama2_c_inference.c's default checkpoint_path/tokenizer_path of
+    llama2_inference.c's default checkpoint_path/tokenizer_path of
     "model.bin"/"tokenizer.bin", which must physically exist in the
     directory the binary runs in)."""
     name = source.stem

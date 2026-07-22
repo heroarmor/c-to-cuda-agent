@@ -18,14 +18,23 @@ scientific-computing fields rather than being all linear algebra.
 benchmark/<difficulty>/<field>/<program>.c
 ```
 
-### easy/ — embarrassingly parallel, one kernel, trivial host
+**41 benchmarks** in all — easy (13), moderate (10), complex (18) — plus one
+build tool (`complex/dnn/llama2_gen_checkpoint.c`), so 42 `.c` files total.
 
-Obvious data parallelism, a single device kernel, and a host that just
-allocates / copies / launches. Good first demos.
+### easy/ — embarrassingly parallel, one or a few simple kernels, trivial host
+
+Obvious data parallelism, one (or a few) straightforward device kernels, and a
+host that just allocates / copies / launches. Good first demos.
 
 | Field | File | What converting it exercises |
 |-------|------|------------------------------|
 | Dense linear algebra | `easy/dense-linalg/saxpy.c` | Element-wise BLAS-1; memory-bound, one thread per element |
+| Dense linear algebra | `easy/dense-linalg/reduction.c` | Parallel sum reduction; tree / warp-shuffle reduction to one output |
+| Dense linear algebra | `easy/dense-linalg/gemm.c` | Dense GEMM `C=A·B`; high arithmetic intensity, shared-memory tiling |
+| Sparse linear algebra | `easy/sparse-linalg/spmv.c` | CSR sparse mat-vec; irregular access, one thread/warp per row |
+| Tensor algebra | `easy/tensor/tensor_contraction.c` | Rank-3 tensor contraction (GEMM generalization); multi-index mapping |
+| DNN | `easy/dnn/conv2d_relu.c` | 2D convolution + ReLU (3→8 ch, 3×3); one thread per output pixel |
+| DNN | `easy/dnn/mlp_two_layer.c` | Two-layer MLP forward (dense+ReLU → dense); batched GEMV |
 | PDE / stencil | `easy/pde/heat2d.c` | 2D heat equation, 5-point stencil, double-buffer swap |
 | ODE | `easy/ode/lorenz_ensemble.c` | Ensemble RK4; one thread per trajectory |
 | N-body | `easy/nbody/nbody.c` | All-pairs O(N²) force loop; high arithmetic intensity |
@@ -40,14 +49,16 @@ several kernels and reductions, **or** a time recurrence with resident state.
 
 | Field | File | What converting it exercises |
 |-------|------|------------------------------|
-| Dense linear algebra | `moderate/dense-linalg/gemm.c` | GEMM; shared-memory tiling for reuse |
-| Sparse linear algebra | `moderate/sparse-linalg/spmv.c` | CSR SpMV; irregular access, per-row/warp work |
 | Iterative solver | `moderate/solver/conjugate_gradient.c` | **Host orchestration** of SpMV + dot reductions + AXPY across iterations |
 | PDE / stencil | `moderate/pde/wave2d.c` | Wave equation; stencil with 3-level time recurrence |
-| Tensor algebra | `moderate/tensor/tensor_contraction.c` | Multi-index contraction; fuse transpose with the GEMM |
 | Rendering | `moderate/rendering/raytrace.c` | Per-pixel with branchy control flow (hits, shadow rays) |
 | Signal processing | `moderate/signal/fft1d.c` | Iterative radix-2 FFT; bit reversal and staged butterfly dependencies |
 | Graph analytics | `moderate/graph/pagerank.c` | PageRank on CSR graph; sparse traversal plus per-iteration reductions |
+| Graph analytics | `moderate/graph/bfs_graph.c` | BFS frontier expansion on a CSR graph; irregular traversal, per-level sync |
+| DNN | `moderate/dnn/cnn.c` | CNN inference: conv + ReLU + pool + FC; multi-kernel host orchestration |
+| DNN | `moderate/dnn/multihead_attention.c` | Causal multi-head self-attention (QKᵀ, softmax, ·V); batched matmuls + softmax |
+| DNN | `moderate/dnn/simple_rnn.c` | Vanilla RNN over T timesteps; sequential hidden-state recurrence |
+| Image processing | `moderate/image/image_process.c` | Batch pipeline: RGB→gray, histogram, equalization; multi-stage kernels |
 
 ### complex/ — data dependencies, irregular structure, hierarchy
 
@@ -70,6 +81,15 @@ blocks, or a multi-level recursive control structure.
 | Quantum computing | `complex/quantum/statevector.c` | Gate circuit on a 2ⁿ state vector; stride-by-qubit gather/scatter |
 | Quantum many-body | `complex/manybody/lanczos.c` | Matrix-free Lanczos on a 2ᴺ Heisenberg Hamiltonian |
 | Bioinformatics | `complex/bio/needleman_wunsch.c` | Global sequence alignment DP; anti-diagonal wavefront dependencies |
+| Clustering | `complex/clustering/spectral_clustering.c` | Graph Laplacian + k-means on eigenvectors; dense EVD then iterative assignment |
+| Clustering | `complex/clustering/stream_cluster.c` | Online/streaming k-median over point batches; distance + reassignment passes |
+| DNN training | `complex/dnn/cnn_training.c` | Full CNN training loop (conv/relu/softmax forward + backprop + SGD) on synthetic 28×28 |
+| DNN inference | `complex/dnn/llama2_inference.c` | llama2.c transformer inference (RoPE attention, RMSNorm, SwiGLU); reads a synthetic checkpoint |
+
+> `complex/dnn/llama2_gen_checkpoint.c` is a **build tool, not a benchmark**: it
+> writes the tiny deterministic `model.bin`/`tokenizer.bin` that
+> `llama2_inference.c` reads (the evaluation driver builds them on demand). That
+> is why the tree has 42 `.c` files but **41 benchmarks**.
 
 ## Self-verification
 
@@ -106,7 +126,7 @@ because it has a known target and is robust to floating-point reordering on the 
 ```sh
 make                              # builds bin/<difficulty>/<field>/<name>
 ./bin/easy/dense-linalg/saxpy     # run with defaults
-./bin/moderate/dense-linalg/gemm 1024   # most accept size args (see each file's main())
+./bin/easy/dense-linalg/gemm 1024   # most accept size args (see each file's main())
 make clean
 ```
 

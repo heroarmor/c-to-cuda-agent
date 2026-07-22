@@ -76,8 +76,9 @@ The 12 group-dataset workloads were **moved into `benchmark/`** (via `git mv`,
 **not** rewritten to benchmark's convention — they keep their comment-free source
 (zyj's deliberate "no answer key for the agent" choice) and print a checksum but no
 embedded `time=` region — so `benchmark/` is now intentionally mixed-convention.
-The old `dataset_zyj/` / `dataset_zhr/` dirs retain only orphaned harness scaffolding
-(`measure.py`, `golden/`, `METADATA.md`, `Makefile`).
+The old `dataset_zyj/` / `dataset_zhr/` dirs (and their `measure.py` / `golden/` /
+`METADATA.md` / `Makefile` scaffolding) are no longer part of this repo; the
+suite lives entirely under `benchmark/`, scored by `cuda/` + `evaluation/`.
 
 | Program (new path) | Owner | Tier/field | Bucket | Why |
 |---|---|---|---|---|

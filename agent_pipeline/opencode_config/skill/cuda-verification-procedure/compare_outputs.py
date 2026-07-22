@@ -11,9 +11,10 @@ different parallel reduction order on the GPU) doesn't register as a
 mismatch.
 
 Standalone and self-contained on purpose: agent_pipeline is meant to stay
-decoupled from dataset_zyj, so this intentionally re-implements the same
-line/number-tolerant comparison dataset_zyj/measure.py already uses for
-golden-output diffing, rather than importing across that boundary.
+decoupled from the rest of the repo, so this intentionally re-implements the
+same line/number-tolerant comparison the suite's own drivers (cuda/build_run.sh,
+evaluation/) use for golden-output diffing, rather than importing across that
+boundary.
 
 Usage:
     python3 compare_outputs.py <file_a> <file_b> [--rel-tol 1e-4] [--abs-tol 1e-6]

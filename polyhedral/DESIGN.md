@@ -151,8 +151,10 @@ Wiring constraints (from the existing pipeline, both deliberate):
   profiles attach a directed `CUDA_Graph_Capture` hint to hybrid-mode LLM
   moves. Accepted flags persist in
   `nvcc_flags.txt` (honored by the verify/profile skills, exported with the
-  best `.cu`); `--backend ppcg --optimizer compiler` = fully deterministic,
-  zero-token pipeline. Planning is pure and tested (`test_compiler_moves.py`);
+  best `.cu`); `--backend ppcg --optimizer compiler` = zero-token generate +
+  optimize (the verify/profile stages still run as opencode agents, so the loop
+  isn't model-free end-to-end — see "Still open" below).
+  Planning is pure and tested (`test_compiler_moves.py`);
   the mechanical gate is GPU-verified via `moves_smoke.py` (real nvcc + real
   PPCG `--sizes`, honest rejections on a copy-dominated `gemm`). Still open:
   the full loop around the moves (needs opencode), and per-move reporting in

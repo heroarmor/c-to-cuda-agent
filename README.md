@@ -30,8 +30,10 @@ deterministic compiler paths plugged into its slots:
   time), best-version tracking, and speedup numbers all come from mechanical
   measurement, never from an agent's own claims.
 - **Zero-token deterministic subset** — `--backend ppcg --optimizer compiler`
-  converts and tunes the affine subset (~1/3 of the suite) without any model
-  calls; the LLM covers the irregular long tail.
+  *generates and tunes* the affine subset (~1/3 of the suite) with no model
+  tokens (PPCG codegen + compiler optimize moves). The loop's verify/profile
+  stages still run as cheap opencode agents, so the pipeline itself always needs
+  opencode; the LLM covers the irregular long tail.
 
 ## Repository layout
 
@@ -42,9 +44,10 @@ agent_pipeline/    the 4-agent loop: orchestrator, JSON schemas, compiler
 polyhedral/        deterministic PPCG backend: toolchain build, C→.cu wrapper
                    with delinearization, SCoP prefilter/targets, GPU
                    validation jobs (see DESIGN.md + README.md)
-benchmark/         42 self-contained C workloads across easy/moderate/complex
-                   tiers (dense/sparse linear algebra, PDE, graphs, rendering,
-                   physics, DNN, ...)
+benchmark/         41 self-contained C workloads across easy/moderate/complex
+                   tiers (dense/sparse linalg, PDE, graphs, rendering, physics,
+                   DNN, clustering, ...) + a synthetic-checkpoint build tool
+                   (llama2_gen_checkpoint) — 42 .c files, 41 benchmarks
 cuda/              reference conversions (cuda/<rel>.cu)
 evaluation/        KernelBench-style metric suite: correctness (fast_0),
                    speedup (fast_1/geomean), HW utilization, codegen cost,
@@ -75,6 +78,10 @@ python3 agent_pipeline/run_pipeline.py benchmark/complex/multigrid/multigrid.c \
 
 On a Slurm cluster, run the full pipeline inside its own GPU job (GPUs here are
 `Exclusive_Process`; see `polyhedral/README.md` for the sbatch shapes used).
+
+To drive the pipeline over the **whole benchmark suite** and score the results
+on a server — from environment build through to the metric reports — follow the
+server run-book in **`evaluation/README.md`** (`evaluation/run_dataset.py`).
 
 ## Status
 
@@ -113,7 +120,8 @@ Everything below has been exercised on real hardware (RTX PRO 6000, CUDA 12.8):
 | `polyhedral/DESIGN.md` | why PPCG, the relay architecture, phase plan, risks |
 | `polyhedral/SCOP_CLASSIFICATION.md` | per-program SCoP buckets (A/B/C) with reasons |
 | `polyhedral/README.md` | toolchain usage + per-phase validation status |
-| `evaluation/README.md` | the six KernelBench-adapted metrics |
+| `evaluation/README.md` | the six KernelBench-adapted metrics + the server run-book (env build → evaluation) |
+| `benchmark/README.md` | the 41-workload suite: tiers, fields, per-program conversion notes, invariants |
 
 ## License
 
